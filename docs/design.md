@@ -72,8 +72,7 @@ type Status struct {
 	ID, Owner, Command string
 	Args               []string
 	State              State // Running, Exited, Stopped
-	ExitCode           int   // -1 if killed by a signal
-	StartedAt, EndedAt time.Time
+	ExitCode           *int  // nil while running; -1 if killed by a signal
 }
 ```
 
@@ -87,13 +86,13 @@ Job IDs are random strings generated with `crypto/rand`.
 - **stdout and stderr are both written to one pipe**, so the output is in the
   same order a terminal would show. The trade-off is that clients can't tell
   stdout from stderr.
-- The job gets **no stdin**, **a minimal environment** (only `PATH`, so it can't
-  read server secrets), and **its own process group**, so Stop can also kill its
-  children.
+- The job gets **no stdin** and **a minimal environment** (only `PATH`, so it
+  can't read server secrets).
 - If the executable doesn't exist, `Start` returns an error and no job is created.
 
 Each job has two goroutines. One copies output from the pipe into the job's
-buffer. The other waits for the process to exit and records its exit code.
+buffer. The other waits for the process to exit, records its exit code, then
+drains and closes the pipe.
 
 ### Job states
 
@@ -108,16 +107,14 @@ RUNNING --(Stop requested)-----------> STOPPED
 
 ### How to Stop the job?
 
-- Stop sends `SIGKILL` to the job's process group (`syscall.Kill(-pgid, SIGKILL)`),
-  then waits for the process to exit and returns the final status. Signalling the
-  group also kills the children the job started; a surviving child would hold the
-  output pipe open, so the stream would never end.
+- Stop kills the job process with `cmd.Process.Kill()` (`SIGKILL`), then waits
+  for it to exit and returns the final status.
 - Stopping a job that has already finished just returns its status, so retries
   are safe.
-- Known limitation: an exited process's ID can be reused once the OS has cleaned
-  it up, so Stop only signals while the job is still marked running under its
-  lock. That leaves a window of microseconds. TODO: close it with `pidfd`, or
-  with cgroups at Level 5.
+- **Children are not terminated.** They keep running, but they can no longer
+  affect the job: the stream ends when the job process exits (see
+  [Output streaming](#output-streaming)). Guaranteed cleanup of children needs
+  cgroups, which is out of scope for L4.
 - Trade-off: `SIGKILL` gives the job no chance to clean up. TODO: send `SIGTERM`
   first and use `SIGKILL` only after a grace period.
 
@@ -130,18 +127,27 @@ buffer that only ever grows**. Readers never remove data from it.
 type output struct {
 	mu      sync.Mutex
 	data    []byte        // all output so far
-	done    bool          // process output finished (pipe closed)
-	changed chan struct{} // closed whenever data or done changes
+	done    bool          // no more output will arrive
+	changed chan struct{} // nil unless a reader is waiting; closed to wake them
 }
 ```
 
-- **Writing:** the copier goroutine appends to `data`, then closes `changed` channel to
-  wake every waiting reader and replaces it with a new channel.
+- **Writing:** the copier goroutine appends to `data`, then closes `changed` and
+  sets it back to nil, but only if a reader created one. **A job with no readers
+  allocates no channels**, so it makes no channel garbage for the GC to collect.
 - **Reading:** each client keeps its own position in the buffer.
   - If there is data past its position, it gets that data.
   - If the output is finished, it gets `io.EOF`.
-  - Otherwise it waits on `changed` channel. The goroutine sleeps until new output
-    arrives, **so there is no polling or busy-waiting**.
+  - Otherwise it creates `changed` under the lock if it is nil, then sleeps on
+    that channel until new output arrives, **so there is no polling or
+    busy-waiting**.
+- **Ending the stream:** when the job process exits, the server drains whatever
+  is still in the pipe (using a short read deadline) and then closes its own read
+  end. The copier's `Read` returns, the buffer is marked done, and every reader
+  gets `io.EOF`. **The stream therefore ends when the job exits**, even if a
+  child still holds the write end of the pipe; `exec.Cmd.WaitDelay` does the same
+  for pipes Go creates itself. Anything a surviving child writes after the job
+  exits is dropped: the job is finished and its status is final.
 
 Example: two clients stream the same job, and the job prints `hello`.
 
@@ -156,19 +162,19 @@ sequenceDiagram
     participant CB as Client B
 
     Note over A,B: r.off == len(data) == 5
-    A ->> Buf: mu.Lock(), no new data, wait := changed (ch1), mu.Unlock()
-    B ->> Buf: mu.Lock(), no new data, wait := changed (ch1), mu.Unlock()
+    A ->> Buf: mu.Lock(), no new data, changed = make(chan struct{}) (ch1), mu.Unlock()
+    B ->> Buf: mu.Lock(), no new data, wait := changed (ch1 already exists), mu.Unlock()
     Note over A,B: blocked in select on ch1 (no CPU)
     P ->> C: writes hello to the pipe, pipe.Read returns
     C ->> Buf: mu.Lock(), data = append(data, p...)
-    C ->> Buf: close(ch1), changed = make(chan struct{}) (ch2), mu.Unlock()
+    C ->> Buf: close(ch1), changed = nil, mu.Unlock()
     Buf -->> A: case <-ch1 fires
     Buf -->> B: case <-ch1 fires
     A ->> Buf: mu.Lock(), copy(p, data[5:10]), r.off = 10, mu.Unlock()
     B ->> Buf: mu.Lock(), copy(p, data[5:10]), r.off = 10, mu.Unlock()
     A ->> CA: stream.Send(chunk)
     B ->> CB: stream.Send(chunk) blocks (client B reads slowly)
-    A ->> Buf: mu.Lock(), no new data, wait := changed (ch2), mu.Unlock()
+    A ->> Buf: mu.Lock(), no new data, changed = make(chan struct{}) (ch2), mu.Unlock()
     Note over A: blocked on ch2
     CA --x A: disconnect, r.Close() closes r.left, case <-r.left fires
     Note over A: goroutine exits
@@ -193,26 +199,29 @@ it and ends its goroutine.
 syntax = "proto3";
 package jobworker.v1;
 
-import "google/protobuf/timestamp.proto";
-
 service JobWorker {
-  rpc StartJob(StartJobRequest) returns (JobStatus);
-  rpc StopJob(JobRequest) returns (JobStatus);
-  rpc GetJobStatus(JobRequest) returns (JobStatus);
-  // Streams output from the first byte. Ends when the job's output is complete.
-  rpc StreamJobOutput(JobRequest) returns (stream OutputChunk);
+  rpc StartJob(StartJobRequest) returns (StartJobResponse);
+  rpc StopJob(StopJobRequest) returns (StopJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  // Streams output from the first byte. Ends when the job exits.
+  rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputResponse);
 }
 
+// Each RPC has its own request and response so they can change independently.
 message StartJobRequest {
   string command = 1;
   repeated string args = 2;
 }
+message StartJobResponse { JobStatus status = 1; }
 
-message JobRequest {
-  string job_id = 1;
-}
+message StopJobRequest { string job_id = 1; }
+message StopJobResponse { JobStatus status = 1; }
 
-message OutputChunk {
+message GetJobStatusRequest { string job_id = 1; }
+message GetJobStatusResponse { JobStatus status = 1; }
+
+message StreamJobOutputRequest { string job_id = 1; }
+message StreamJobOutputResponse {
   bytes data = 1; // raw bytes, binary safe, up to 32 KiB per message
 }
 
@@ -229,9 +238,9 @@ message JobStatus {
   string command = 3;
   repeated string args = 4;
   JobState state = 5;
-  int32 exit_code = 6;
-  google.protobuf.Timestamp started_at = 7;
-  google.protobuf.Timestamp ended_at = 8;
+  // Absent while the job is running. Set once it reaches EXITED or STOPPED;
+  // -1 if the process was terminated by a signal.
+  optional int32 exit_code = 6;
 }
 ```
 
@@ -272,8 +281,8 @@ Both sides prove who they are with certificates signed by our CA:
 - **Separate usages:** a server certificate can't be used as a client
   certificate, and the other way round.
 - **The server certificate** is only valid for `localhost` and `127.0.0.1`.
-- **Dev certificates are generated once and committed** under `certs/` for out of box
-  compatibility. Tests generate their own certificates, so they
+- **Dev certificates are generated once and committed** under `certs/` so the
+  demo works out of the box. Tests generate their own certificates, so they
   never break when committed ones expire. TODO: use short-lived certificates
   from a real CA, and never commit keys.
 
@@ -333,7 +342,6 @@ ID:       7GQ2KH5ZC3MJXN4R6T8VWYBDEF
 Owner:    jimmy
 Command:  ping -c 3 localhost
 State:    RUNNING
-Started:  2026-09-16T17:02:11Z
 
 # Args containing spaces are quoted, so the line shows exactly what ran
 $ worker status M3XR8TQ2ZK7HJWNC4PAB5DVEFY
@@ -366,7 +374,7 @@ error: job not found
 | Client connects mid-run | Gets everything from the start, then live output. |
 | Client disconnects mid-stream | Reader closed; its goroutine exits. |
 | Stop a finished job | Returns the final status, idempotent. |
-| Child keeps running after the main process exits | Status is `EXITED`; the stream stays open until the child exits (assuming full cleanup is out of scope for lv4). |
+| Child keeps running after the main process exits | Status is `EXITED` and the stream ends, because the server closes its end of the pipe. The child keeps running unheard; terminating it is out of scope for lv4. |
 | Output bigger than a gRPC message | Sent in 32 KiB chunks. |
 | Another user's job | `NotFound`. |
 | Server shuts down | Jobs are killed and streams end. |
@@ -378,14 +386,15 @@ All tests run with `go test -race`.
 - **Output buffer:** late readers should get the full output; many readers should get
   identical output; `Read` should block and then wake on new data; `Close` should unblock
   a waiting `Read`; binary data should come back unchanged.
-- **Manager:** test exit codes, missing executable, stopping a job (including its
-  children), stopping a finished job, unknown job ID.
+- **Manager:** test exit codes, missing executable, stopping a job, stopping a
+  finished job, unknown job ID. A job that leaves a child holding the output
+  pipe should still end its stream when the job itself exits.
 - **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed;
   unknown user should get `PermissionDenied`.
 - **mTLS, server side:** a valid client should work. The server should REJECT a client with
   no certificate / a certificate from an untrusted CA / an expired certificate / a
   server certificate used as a client certificate / a client limited to
-  TLS 1.2 
+  TLS 1.2
 - **mTLS, client side:** the client should reject a server certificate from an
   untrusted CA, or one that doesn't match the hostname.
 
@@ -402,8 +411,8 @@ docs/design.md
 ```
 
 **Reproducible builds:**
-- Go 1.24 or newer, pinned in `go.mod`, with dependencies locked in `go.sum`.
-  (using 1.24 for `crypto/rand.Text`)
+- Go 1.27 (the current stable release), pinned in `go.mod`, with dependencies
+  locked in `go.sum`. 1.24 is the floor, since `crypto/rand.Text` arrived there.
 - Generated protobuf code committed.
 - `make build` and `make test` targets.
 
@@ -418,6 +427,7 @@ handling, output streaming, TLS and the CLI, uses the standard library.
 | stdout and stderr in one stream | Separate streams | Keeps the true order of output. |
 | One shared buffer with a position per reader | A channel per client | Late clients get the full output, and a slow client never blocks the job. |
 | `SIGKILL` on Stop | `SIGTERM`, then `SIGKILL` after a grace period | Simpler; the graceful version is a TODO. |
+| End the stream when the job exits | Wait for the pipe to close | The stream ends promptly even if a child still holds the pipe. Output a surviving child writes afterwards is dropped. |
 | Roles stored on the server | Roles in the certificate | Roles can change without reissuing certificates. |
 
 ## Future work
