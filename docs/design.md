@@ -33,7 +33,10 @@ requirements.
 **Assumptions**
 - The server runs on 64-bit Linux as a normal (non-root) user. Jobs run on the
   same machine as child processes of the server.
-- The CLI can run anywhere that can reach the server.
+- The CLI runs on the same host as the server: the server binds loopback and the
+  dev certificates only cover `localhost` and `127.0.0.1`. TODO: running the CLI
+  remotely means binding a real address and issuing a server certificate with
+  that hostname or IP in its SANs.
 
 ## Architecture
 
@@ -83,16 +86,18 @@ Job IDs are random strings generated with `crypto/rand`.
 - The server runs the command directly with `exec.Command(command, args...)`.
   **No shell is involved**, so arguments are passed exactly as given. Users who
   want pipes or globs can run `bash -c "..."` as the job itself.
-- **stdout and stderr are both written to one pipe**, so the output is in the
-  same order a terminal would show. The trade-off is that clients can't tell
+- **`cmd.Stdout` and `cmd.Stderr` are both the job's output buffer**, a plain
+  `io.Writer`, so `os/exec` creates and owns the pipe. Sharing one writer keeps
+  the output in the order a terminal would show it, and `os/exec` guarantees
+  only one goroutine writes at a time. The trade-off is that clients can't tell
   stdout from stderr.
 - The job gets **no stdin** and **a minimal environment** (only `PATH`, so it
   can't read server secrets).
 - If the executable doesn't exist, `Start` returns an error and no job is created.
 
-Each job has two goroutines. One copies output from the pipe into the job's
-buffer. The other waits for the process to exit, records its exit code, then
-drains and closes the pipe.
+Each job needs one goroutine of its own: a waiter that calls `cmd.Wait()`,
+records the exit code, and marks the output done. The goroutine copying from the
+pipe into the buffer comes from `os/exec`, along with the pipe itself.
 
 ### Job states
 
@@ -107,14 +112,19 @@ RUNNING --(Stop requested)-----------> STOPPED
 
 ### How to Stop the job?
 
-- Stop kills the job process with `cmd.Process.Kill()` (`SIGKILL`), then waits
-  for it to exit and returns the final status.
-- Stopping a job that has already finished just returns its status, so retries
+- Stop takes the job's lock and checks its state first. A job that has already
+  finished is never signalled: Stop just returns the final status, so retries
   are safe.
-- **Children are not terminated.** They keep running, but they can no longer
-  affect the job: the stream ends when the job process exits (see
-  [Output streaming](#output-streaming)). Guaranteed cleanup of children needs
-  cgroups, which is out of scope for L4.
+- A running job is killed with `cmd.Process.Kill()` (`SIGKILL`). Stop then waits
+  for the process to exit and returns the final status. The context bounds that
+  wait: cancelling it means the caller stops waiting, not that the job survives,
+  since the signal has already been sent. The final status is available
+  afterwards through `GetJobStatus`.
+- **Children are not terminated, and they can interfere.** A child that inherits
+  the output pipe keeps it open, and with `WaitDelay` unset that blocks `Wait`
+  until the child exits. Setting `cmd.WaitDelay` is what makes them harmless
+  (see [Output streaming](#output-streaming)). Terminating children reliably
+  needs cgroups, which is out of scope for L4.
 - Trade-off: `SIGKILL` gives the job no chance to clean up. TODO: send `SIGTERM`
   first and use `SIGKILL` only after a grace period.
 
@@ -125,66 +135,119 @@ buffer that only ever grows**. Readers never remove data from it.
 
 ```go
 type output struct {
-	mu      sync.Mutex
-	data    []byte        // all output so far
-	done    bool          // no more output will arrive
-	changed chan struct{} // nil unless a reader is waiting; closed to wake them
+	mu   sync.Mutex
+	cond *sync.Cond // sync.NewCond(&mu); signals data, done and reader closes
+	data []byte     // all output so far
+	done bool       // no more output will arrive
 }
 ```
 
-- **Writing:** the copier goroutine appends to `data`, then closes `changed` and
-  sets it back to nil, but only if a reader created one. **A job with no readers
-  allocates no channels**, so it makes no channel garbage for the GC to collect.
-- **Reading:** each client keeps its own position in the buffer.
-  - If there is data past its position, it gets that data.
-  - If the output is finished, it gets `io.EOF`.
-  - Otherwise it creates `changed` under the lock if it is nil, then sleeps on
-    that channel until new output arrives, **so there is no polling or
-    busy-waiting**.
-- **Ending the stream:** when the job process exits, the server drains whatever
-  is still in the pipe (using a short read deadline) and then closes its own read
-  end. The copier's `Read` returns, the buffer is marked done, and every reader
-  gets `io.EOF`. **The stream therefore ends when the job exits**, even if a
-  child still holds the write end of the pipe; `exec.Cmd.WaitDelay` does the same
-  for pipes Go creates itself. Anything a surviving child writes after the job
-  exits is dropped: the job is finished and its status is final.
+One mutex covers `data`, `done` and each reader's position. `sync.Cond` carries
+every wake-up, so **nothing is allocated on the write path**, whether or not
+anyone is streaming, and readers never have to set anything up for the writer.
+
+```go
+// Write is called by the copier goroutine os/exec runs for cmd.Stdout.
+func (o *output) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.data = append(o.data, p...)
+	o.cond.Broadcast() // wake every waiting reader
+	return len(p), nil
+}
+
+// finish is called by the waiter goroutine once cmd.Wait returns.
+func (o *output) finish() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.done = true
+	o.cond.Broadcast()
+}
+
+// reader is one streaming client's view of the buffer.
+type reader struct {
+	out    *output
+	off    int  // how far this client has read
+	closed bool // set by Close when the client goes away
+}
+
+func (r *reader) Read(p []byte) (int, error) {
+	o := r.out
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for r.off == len(o.data) && !o.done && !r.closed {
+		o.cond.Wait() // releases o.mu while blocked, re-acquires on wake
+	}
+	switch {
+	case r.closed:
+		return 0, errReaderClosed
+	case r.off == len(o.data):
+		return 0, io.EOF
+	}
+	n := copy(p, o.data[r.off:]) // copied under the lock
+	r.off += n
+	return n, nil
+}
+
+func (r *reader) Close() error {
+	r.out.mu.Lock()
+	defer r.out.mu.Unlock()
+	r.closed = true
+	r.out.cond.Broadcast()
+	return nil
+}
+```
+
+The lock is only held for the append or the copy, **never across
+`stream.Send`**, which happens in the handler after `read` returns. `cond.wait`
+sits in a loop because a broadcast may signal a state the reader isn't waiting
+for, such as another reader closing.
+
+- **Ending the stream:** `cmd.Stdout` and `cmd.Stderr` are the job's buffer as a
+  plain `io.Writer`, so `os/exec` owns the pipe, copies into the buffer, and
+  `cmd.WaitDelay` applies. When the process exits, `os/exec` closes the pipe
+  after the delay even if a child still holds the write fd, ends its copier
+  goroutine, and `Wait` returns (`ErrWaitDelay` when a surviving child caused
+  it, which means output was cut short, not that the job failed). The buffer is
+  then marked done and every reader gets `io.EOF`, so **the stream ends when the
+  job exits**. Using one writer for both streams also keeps the output ordered,
+  since `os/exec` guarantees only one goroutine writes at a time.
 
 Example: two clients stream the same job, and the job prints `hello`.
 
 ```mermaid
 sequenceDiagram
     participant P as Job process
-    participant C as Copier goroutine
+    participant C as Copier goroutine from os/exec
     participant Buf as output buffer
     participant A as Reader A (handler goroutine)
     participant B as Reader B (handler goroutine)
     participant CA as Client A
     participant CB as Client B
 
-    Note over A,B: r.off == len(data) == 5
-    A ->> Buf: mu.Lock(), no new data, changed = make(chan struct{}) (ch1), mu.Unlock()
-    B ->> Buf: mu.Lock(), no new data, wait := changed (ch1 already exists), mu.Unlock()
-    Note over A,B: blocked in select on ch1 (no CPU)
-    P ->> C: writes hello to the pipe, pipe.Read returns
-    C ->> Buf: mu.Lock(), data = append(data, p...)
-    C ->> Buf: close(ch1), changed = nil, mu.Unlock()
-    Buf -->> A: case <-ch1 fires
-    Buf -->> B: case <-ch1 fires
-    A ->> Buf: mu.Lock(), copy(p, data[5:10]), r.off = 10, mu.Unlock()
-    B ->> Buf: mu.Lock(), copy(p, data[5:10]), r.off = 10, mu.Unlock()
+    Note over A,B: off == len(data) == 5
+    A ->> Buf: mu.Lock(), no new data, cond.Wait()
+    B ->> Buf: mu.Lock(), no new data, cond.Wait()
+    Note over A,B: blocked in cond.Wait(), mu released, no CPU
+    P ->> C: writes hello to the pipe
+    C ->> Buf: mu.Lock(), data = append(data, p...), cond.Broadcast(), mu.Unlock()
+    Buf -->> A: Wait returns, re-checks the loop condition
+    Buf -->> B: Wait returns, re-checks the loop condition
+    A ->> Buf: copy(buf, data[5:10]), off = 10, mu.Unlock()
+    B ->> Buf: copy(buf, data[5:10]), off = 10, mu.Unlock()
     A ->> CA: stream.Send(chunk)
     B ->> CB: stream.Send(chunk) blocks (client B reads slowly)
-    A ->> Buf: mu.Lock(), no new data, changed = make(chan struct{}) (ch2), mu.Unlock()
-    Note over A: blocked on ch2
-    CA --x A: disconnect, r.Close() closes r.left, case <-r.left fires
-    Note over A: goroutine exits
+    A ->> Buf: mu.Lock(), no new data, cond.Wait()
+    Note over A: blocked in cond.Wait()
+    CA --x A: disconnect, AfterFunc calls r.Close()
+    Note over A: closed = true, Broadcast, Read returns, goroutine exits
 ```
 
 The requirements follow directly:
 
 | Requirement | How |
 | --- | --- |
-| No polling | Readers sleep on a channel and are woken when new output arrives. |
+| No polling | Readers block in `cond.Wait()` and are woken by the writer's `Broadcast`. |
 | From the start | Every reader starts at position 0 of a buffer that is never trimmed. |
 | Many clients | Each reader has its own position; the buffer is shared. |
 | Binary-safe | Bytes are copied exactly as written; nothing is parsed. |
@@ -319,8 +382,12 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
 ## Server behaviour
 
 - **Streams:** the handler reads output and sends chunks until the output ends.
-  If the client disconnects, the stream's context is cancelled, the reader is
-  closed, and the handler returns.
+- **Disconnects:** the handler can't notice them itself, since it is blocked
+  inside `Read`. Before the loop it registers
+  `context.AfterFunc(stream.Context(), reader.Close)`, so when gRPC cancels the
+  stream context, `Close` runs on its own goroutine, sets the reader's closed
+  flag and broadcasts, and the blocked `Read` returns. A deferred `Close` covers
+  the normal path, where the output simply ends.
 - **Keepalive pings** detect dead clients on streams that are idle because the
   job isn't printing anything.
 - **Shutdown:** kill all jobs first, so every stream ends, then stop the gRPC
@@ -354,9 +421,19 @@ PING localhost (127.0.0.1) 56(84) bytes of data.
 64 bytes from localhost (127.0.0.1): icmp_seq=1 ttl=64 time=0.03 ms
 ...
 
+# A job that finished on its own. While a job is running there is no exit code,
+# so the line is left out rather than printed as 0
+$ worker status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
+ID:        7GQ2KH5ZC3MJXN4R6T8VWYBDEF
+Owner:     jimmy
+Command:   ping -c 3 localhost
+State:     EXITED
+Exit code: 0
+
 # Stop
-$ worker stop 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-State:    STOPPED
+$ worker stop M3XR8TQ2ZK7HJWNC4PAB5DVEFY
+State:     STOPPED
+Exit code: -1 (killed by SIGKILL)
 
 # Errors go to stderr with a non-zero exit code
 $ worker --cert certs/jimbob.crt --key certs/jimbob.key status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
@@ -389,6 +466,11 @@ All tests run with `go test -race`.
 - **Manager:** test exit codes, missing executable, stopping a job, stopping a
   finished job, unknown job ID. A job that leaves a child holding the output
   pipe should still end its stream when the job itself exits.
+- **Stream handler:** starting a job that prints nothing, opening a stream and
+  then dropping the client should end the handler and close the reader. The
+  silent job is the point: the handler is blocked in `Read` with nothing to
+  send, so only the cancellation hook can unblock it, and a broken one hangs the
+  test rather than passing by luck. No goroutines should be left behind.
 - **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed;
   unknown user should get `PermissionDenied`.
 - **mTLS, server side:** a valid client should work. The server should REJECT a client with
@@ -426,6 +508,7 @@ handling, output streaming, TLS and the CLI, uses the standard library.
 | Output in memory | Output in a file | Simpler; no file cleanup. Memory grows with output (TODO: cap it and spill to disk). |
 | stdout and stderr in one stream | Separate streams | Keeps the true order of output. |
 | One shared buffer with a position per reader | A channel per client | Late clients get the full output, and a slow client never blocks the job. |
+| `sync.Cond` for wake-ups | A channel closed and replaced on each write | Nothing allocated on the write path, and readers set nothing up for the writer. |
 | `SIGKILL` on Stop | `SIGTERM`, then `SIGKILL` after a grace period | Simpler; the graceful version is a TODO. |
 | End the stream when the job exits | Wait for the pipe to close | The stream ends promptly even if a child still holds the pipe. Output a surviving child writes afterwards is dropped. |
 | Roles stored on the server | Roles in the certificate | Roles can change without reissuing certificates. |
