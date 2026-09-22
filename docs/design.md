@@ -146,6 +146,13 @@ One mutex covers `data`, `done` and each reader's position. `sync.Cond` carries
 every wake-up, so **nothing is allocated on the write path**, whether or not
 anyone is streaming, and readers never have to set anything up for the writer.
 
+**Readers copy without holding the lock.** `data` is append-only: `append` only
+writes at or above `len`, and a reallocation leaves the old array untouched, so
+bytes already written can never change. A reader therefore takes the slice
+header and claims a range under the lock — a few field reads — and does the copy
+outside it, so **many clients copy in parallel** instead of queuing behind each
+other while the writer waits its turn.
+
 ```go
 // Write is called by the copier goroutine os/exec runs for cmd.Stdout.
 func (o *output) Write(p []byte) (int, error) {
@@ -174,19 +181,24 @@ type reader struct {
 func (r *reader) Read(p []byte) (int, error) {
 	o := r.out
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	for r.off == len(o.data) && !o.done && !r.closed {
 		o.cond.Wait() // releases o.mu while blocked, re-acquires on wake
 	}
 	switch {
 	case r.closed:
+		o.mu.Unlock()
 		return 0, errReaderClosed
 	case r.off == len(o.data):
+		o.mu.Unlock()
 		return 0, io.EOF
 	}
-	n := copy(p, o.data[r.off:]) // copied under the lock
+	// Snapshot the slice header and claim a range, then copy without the lock.
+	data, off := o.data, r.off
+	n := min(len(data)-off, len(p))
 	r.off += n
-	return n, nil
+	o.mu.Unlock()
+
+	return copy(p, data[off:off+n]), nil
 }
 
 func (r *reader) Close() error {
@@ -198,10 +210,11 @@ func (r *reader) Close() error {
 }
 ```
 
-The lock is only held for the append or the copy, **never across
-`stream.Send`**, which happens in the handler after `read` returns. `cond.wait`
-sits in a loop because a broadcast may signal a state the reader isn't waiting
-for, such as another reader closing.
+The lock is held for the append on the write side and for the snapshot on the
+read side, **never across the copy and never across `stream.Send`**, which
+happens in the handler after `Read` returns. `cond.Wait` sits in a loop because
+a broadcast may signal a state the reader isn't waiting for, such as another
+reader closing.
 
 - **Ending the stream:** `cmd.Stdout` and `cmd.Stderr` are the job's buffer as a
   plain `io.Writer`, so `os/exec` owns the pipe, copies into the buffer, and
@@ -509,6 +522,7 @@ handling, output streaming, TLS and the CLI, uses the standard library.
 | stdout and stderr in one stream | Separate streams | Keeps the true order of output. |
 | One shared buffer with a position per reader | A channel per client | Late clients get the full output, and a slow client never blocks the job. |
 | `sync.Cond` for wake-ups | A channel closed and replaced on each write | Nothing allocated on the write path, and readers set nothing up for the writer. |
+| Copy outside the lock | Copy under the lock, or an `RWMutex` | Readers copy in parallel with a plain mutex, since append-only data can't change under them. |
 | `SIGKILL` on Stop | `SIGTERM`, then `SIGKILL` after a grace period | Simpler; the graceful version is a TODO. |
 | End the stream when the job exits | Wait for the pipe to close | The stream ends promptly even if a child still holds the pipe. Output a surviving child writes afterwards is dropped. |
 | Roles stored on the server | Roles in the certificate | Roles can change without reissuing certificates. |
