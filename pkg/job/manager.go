@@ -2,7 +2,7 @@
 // combined output to any number of readers.
 //
 // TODO: out of scope - cgroups resource limits and guaranteed cleanup of child processes.
-// TODO: out of scope -limits on output size, number of jobs, and how long finished jobs are kept.
+// TODO: out of scope - limits on output size, number of jobs, and how long finished jobs are kept.
 package job
 
 import (
