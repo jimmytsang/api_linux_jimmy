@@ -507,7 +507,7 @@ docs/design.md
 
 **Reproducible builds:**
 - Go 1.27 (the current stable release), pinned in `go.mod`, with dependencies
-  locked in `go.sum`. 1.24 is the floor, since `crypto/rand.Text` arrived there.
+  locked in `go.sum`.
 - Generated protobuf code committed.
 - `make build` and `make test` targets.
 
