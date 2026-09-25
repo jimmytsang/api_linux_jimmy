@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -59,6 +60,10 @@ type Status struct {
 	Args               []string
 	State              State
 	ExitCode           *int // nil while running; -1 if killed by a signal
+	// Signal is the signal that terminated the job, such as SIGKILL from Stop
+	// or SIGSEGV from a crash. It is 0 while running and when the job exited
+	// with a status code.
+	Signal syscall.Signal
 }
 
 // Manager starts jobs and keeps track of them. It is safe for concurrent use.
@@ -75,6 +80,10 @@ func NewManager() *Manager {
 // Start runs command with args as a new job owned by owner. The command runs
 // directly, without a shell, with no stdin and only PATH in its environment.
 // If the command can't be started, no job is created.
+//
+// owner is an opaque label kept with the job and returned in its Status. The
+// library makes no decisions with it; it lives here so a job and its owner are
+// created, stored and (eventually) removed together.
 func (m *Manager) Start(owner, command string, args []string) (Status, error) {
 	// Cheap early check so a closed manager doesn't fork a process just to
 	// kill it. The check after cmd.Start below is the one that closes the race.
@@ -212,8 +221,9 @@ type job struct {
 
 	mu            sync.Mutex
 	state         State
-	exitCode      int  // valid once state is not Running
-	stopRequested bool // set by kill; decides Stopped vs Exited
+	exitCode      int            // valid once state is not Running
+	signal        syscall.Signal // valid once state is not Running; 0 unless signalled
+	stopRequested bool           // set by kill; decides Stopped vs Exited
 }
 
 // wait runs on its own goroutine for the life of the job. It is the only
@@ -224,13 +234,17 @@ func (j *job) wait() {
 	// pipe and its later output was dropped. Neither changes the job's status.
 	_ = j.cmd.Wait()
 
-	code := -1
+	code, sig := -1, syscall.Signal(0)
 	if ps := j.cmd.ProcessState; ps != nil {
 		code = ps.ExitCode() // -1 if terminated by a signal
+		if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			sig = ws.Signal()
+		}
 	}
 
 	j.mu.Lock()
 	j.exitCode = code
+	j.signal = sig
 	if j.stopRequested {
 		j.state = Stopped
 	} else {
@@ -275,8 +289,8 @@ func (j *job) status() Status {
 		State:   j.state,
 	}
 	if j.state != Running {
-		code := j.exitCode
-		s.ExitCode = &code
+		s.ExitCode = new(j.exitCode)
+		s.Signal = j.signal
 	}
 	return s
 }

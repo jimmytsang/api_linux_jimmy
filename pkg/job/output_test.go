@@ -142,8 +142,8 @@ func TestOutputCloseUnblocksRead(t *testing.T) {
 		synctest.Wait()
 		select {
 		case r := <-closingRes:
-			if !errors.Is(r.err, errReaderClosed) {
-				t.Fatalf("Read err = %v, want errReaderClosed", r.err)
+			if !errors.Is(r.err, io.ErrClosedPipe) {
+				t.Fatalf("Read err = %v, want io.ErrClosedPipe", r.err)
 			}
 		default:
 			t.Fatal("Read still blocked after Close")
@@ -158,8 +158,8 @@ func TestOutputCloseUnblocksRead(t *testing.T) {
 		}
 
 		// Reads after Close keep failing, and Close is idempotent.
-		if _, err := closing.Read(make([]byte, 8)); !errors.Is(err, errReaderClosed) {
-			t.Errorf("Read after Close err = %v, want errReaderClosed", err)
+		if _, err := closing.Read(make([]byte, 8)); !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("Read after Close err = %v, want io.ErrClosedPipe", err)
 		}
 		closing.Close()
 

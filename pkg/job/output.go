@@ -1,13 +1,9 @@
 package job
 
 import (
-	"errors"
 	"io"
 	"sync"
 )
-
-// errReaderClosed is returned by Read once the reader has been closed.
-var errReaderClosed = errors.New("output reader closed")
 
 // output holds all of a job's output in a buffer that only ever grows.
 //
@@ -59,8 +55,12 @@ type reader struct {
 }
 
 // Read blocks until there is output past the reader's position, the output is
-// done (io.EOF), or the reader is closed.
+// done (io.EOF), or the reader is closed (io.ErrClosedPipe, as io.PipeReader
+// returns).
 func (r *reader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	o := r.out
 	o.mu.Lock()
 	for r.off == len(o.data) && !o.done && !r.closed {
@@ -69,20 +69,19 @@ func (r *reader) Read(p []byte) (int, error) {
 	switch {
 	case r.closed:
 		o.mu.Unlock()
-		return 0, errReaderClosed
+		return 0, io.ErrClosedPipe
 	case r.off == len(o.data):
 		o.mu.Unlock()
 		return 0, io.EOF
 	}
-	// Snapshot the slice header and claim a range, then copy without the lock.
-	// data is append-only, so bytes below len(data) never change: append
-	// writes only past len, and a reallocation leaves the old array untouched.
-	data, off := o.data, r.off
-	n := min(len(data)-off, len(p))
-	r.off += n
+	// Claim up to len(p) bytes under the lock, then copy them without it. data
+	// is append-only, so bytes below len(data) never change: append writes
+	// only past len, and a reallocation leaves the old array untouched.
+	chunk := o.data[r.off:min(len(o.data), r.off+len(p))]
+	r.off += len(chunk)
 	o.mu.Unlock()
 
-	return copy(p, data[off:off+n]), nil
+	return copy(p, chunk), nil
 }
 
 // Close wakes a Read blocked on this reader and makes it return. It is safe

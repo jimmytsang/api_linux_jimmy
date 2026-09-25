@@ -6,6 +6,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -67,10 +68,30 @@ func readOutput(t *testing.T, m *Manager, id string) (string, Status) {
 	}
 }
 
-func checkFinal(t *testing.T, s Status, state State, code int) {
+// waitExit waits for the job to finish, without reading its output, and
+// returns its final status. The waiter closes done only after recording it.
+func waitExit(t *testing.T, m *Manager, id string) Status {
+	t.Helper()
+	j, err := m.get(id)
+	if err != nil {
+		t.Fatalf("get(%s): %v", id, err)
+	}
+	select {
+	case <-j.done:
+		return j.status()
+	case <-time.After(testTimeout):
+		t.Fatalf("job %s did not exit within %v", id, testTimeout)
+		return Status{}
+	}
+}
+
+func checkFinal(t *testing.T, s Status, state State, code int, sig syscall.Signal) {
 	t.Helper()
 	if s.State != state {
 		t.Errorf("state = %v, want %v", s.State, state)
+	}
+	if s.Signal != sig {
+		t.Errorf("signal = %d (%v), want %d (%v)", s.Signal, s.Signal, sig, sig)
 	}
 	if s.ExitCode == nil {
 		t.Fatalf("exit code = nil, want %d", code)
@@ -91,6 +112,9 @@ func TestStartReturnsRunningStatus(t *testing.T) {
 	if s.ExitCode != nil {
 		t.Errorf("exit code = %d while running, want nil", *s.ExitCode)
 	}
+	if s.Signal != 0 {
+		t.Errorf("signal = %v while running, want 0", s.Signal)
+	}
 
 	// The caller's args and the returned Status are copies of the job's.
 	args[0] = "changed"
@@ -106,18 +130,20 @@ func TestExitCodes(t *testing.T) {
 		command string
 		args    []string
 		code    int
+		sig     syscall.Signal
 	}{
-		{"success", "true", nil, 0},
-		{"failure", "sh", []string{"-c", "exit 3"}, 3},
-		// Killed by a signal it didn't get from Stop: still Exited, code -1.
-		{"signal", "sh", []string{"-c", "kill -9 $$"}, -1},
+		{"success", "true", nil, 0, 0},
+		{"failure", "sh", []string{"-c", "exit 3"}, 3, 0},
+		// Killed by signals it didn't get from Stop: still Exited, code -1,
+		// and Signal tells an OOM-style SIGKILL apart from a crash.
+		{"sigkill", "sh", []string{"-c", "kill -KILL $$"}, -1, syscall.SIGKILL},
+		{"sigsegv", "sh", []string{"-c", "kill -SEGV $$"}, -1, syscall.SIGSEGV},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := newTestManager(t)
 			s := start(t, m, tt.command, tt.args...)
-			_, final := readOutput(t, m, s.ID)
-			checkFinal(t, final, Exited, tt.code)
+			checkFinal(t, waitExit(t, m, s.ID), Exited, tt.code, tt.sig)
 		})
 	}
 }
@@ -163,31 +189,31 @@ func TestStop(t *testing.T) {
 	m := newTestManager(t)
 	s := start(t, m, "sleep", "30")
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
 	stopped, err := m.Stop(ctx, s.ID)
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	checkFinal(t, stopped, Stopped, -1)
+	checkFinal(t, stopped, Stopped, -1, syscall.SIGKILL)
 
 	// The stream ends once the job is stopped.
 	_, final := readOutput(t, m, s.ID)
-	checkFinal(t, final, Stopped, -1)
+	checkFinal(t, final, Stopped, -1, syscall.SIGKILL)
 }
 
 func TestStopFinishedJob(t *testing.T) {
 	m := newTestManager(t)
 	s := start(t, m, "sh", "-c", "exit 7")
-	readOutput(t, m, s.ID)
+	waitExit(t, m, s.ID)
 
 	// Never signalled, stays Exited, and repeated Stops agree.
 	for range 2 {
-		got, err := m.Stop(context.Background(), s.ID)
+		got, err := m.Stop(t.Context(), s.ID)
 		if err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-		checkFinal(t, got, Exited, 7)
+		checkFinal(t, got, Exited, 7, 0)
 	}
 }
 
@@ -195,15 +221,14 @@ func TestStopCancelledContextStillKills(t *testing.T) {
 	m := newTestManager(t)
 	s := start(t, m, "sleep", "30")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	// Stop may see either the cancelled context or the job's exit first; both
 	// are correct. Either way the signal has been sent.
 	if _, err := m.Stop(ctx, s.ID); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Stop: %v", err)
 	}
-	_, final := readOutput(t, m, s.ID)
-	checkFinal(t, final, Stopped, -1)
+	checkFinal(t, waitExit(t, m, s.ID), Stopped, -1, syscall.SIGKILL)
 }
 
 func TestUnknownID(t *testing.T) {
@@ -211,7 +236,7 @@ func TestUnknownID(t *testing.T) {
 	if _, err := m.Status("nope"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Status err = %v, want ErrNotFound", err)
 	}
-	if _, err := m.Stop(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Stop(t.Context(), "nope"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Stop err = %v, want ErrNotFound", err)
 	}
 	if _, err := m.Output("nope"); !errors.Is(err, ErrNotFound) {
@@ -234,11 +259,11 @@ func TestChildHoldingPipeDoesNotHoldStream(t *testing.T) {
 	if got != "hi\n" {
 		t.Errorf("output = %q, want %q", got, "hi\n")
 	}
-	checkFinal(t, final, Exited, 0)
+	checkFinal(t, final, Exited, 0, 0)
 }
 
 func TestClose(t *testing.T) {
-	m := NewManager()
+	m := newTestManager(t)
 	s := start(t, m, "sleep", "30")
 
 	if err := m.Close(); err != nil {
@@ -249,7 +274,7 @@ func TestClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status after Close: %v", err)
 	}
-	checkFinal(t, got, Stopped, -1)
+	checkFinal(t, got, Stopped, -1, syscall.SIGKILL)
 
 	if _, err := m.Start("alice", "true", nil); !errors.Is(err, ErrClosed) {
 		t.Errorf("Start after Close err = %v, want ErrClosed", err)

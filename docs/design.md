@@ -74,8 +74,9 @@ func (m *Manager) Close() error                             // kills all jobs on
 type Status struct {
 	ID, Owner, Command string
 	Args               []string
-	State              State // Running, Exited, Stopped
-	ExitCode           *int  // nil while running; -1 if killed by a signal
+	State              State          // Running, Exited, Stopped
+	ExitCode           *int           // nil while running; -1 if killed by a signal
+	Signal             syscall.Signal // what killed it (e.g. SIGKILL, SIGSEGV); 0 otherwise
 }
 ```
 
@@ -179,6 +180,9 @@ type reader struct {
 }
 
 func (r *reader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	o := r.out
 	o.mu.Lock()
 	for r.off == len(o.data) && !o.done && !r.closed {
@@ -187,18 +191,17 @@ func (r *reader) Read(p []byte) (int, error) {
 	switch {
 	case r.closed:
 		o.mu.Unlock()
-		return 0, errReaderClosed
+		return 0, io.ErrClosedPipe
 	case r.off == len(o.data):
 		o.mu.Unlock()
 		return 0, io.EOF
 	}
-	// Snapshot the slice header and claim a range, then copy without the lock.
-	data, off := o.data, r.off
-	n := min(len(data)-off, len(p))
-	r.off += n
+	// Claim up to len(p) bytes under the lock, then copy them without it.
+	chunk := o.data[r.off:min(len(o.data), r.off+len(p))]
+	r.off += len(chunk)
 	o.mu.Unlock()
 
-	return copy(p, data[off:off+n]), nil
+	return copy(p, chunk), nil
 }
 
 func (r *reader) Close() error {
@@ -317,6 +320,9 @@ message JobStatus {
   // Absent while the job is running. Set once it reaches EXITED or STOPPED;
   // -1 if the process was terminated by a signal.
   optional int32 exit_code = 6;
+  // Set only when a signal terminated the process: its number, e.g. 9 for
+  // SIGKILL (Stop, or the OOM killer) or 11 for SIGSEGV (a crash).
+  optional int32 signal = 7;
 }
 ```
 
@@ -446,7 +452,12 @@ Exit code: 0
 # Stop
 $ worker stop M3XR8TQ2ZK7HJWNC4PAB5DVEFY
 State:     STOPPED
-Exit code: -1 (killed by SIGKILL)
+Exit code: -1 (signal 9: killed)
+
+# A job that crashed: the signal tells it apart from a Stop or an OOM kill
+$ worker status Q8WN3KZT5RJC7HMX2PVB4DYEFA
+State:     EXITED
+Exit code: -1 (signal 11: segmentation fault)
 
 # Errors go to stderr with a non-zero exit code
 $ worker --cert certs/jimbob.crt --key certs/jimbob.key status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
