@@ -28,6 +28,15 @@ func start(t *testing.T, m *Manager, command string, args ...string) Status {
 	if err != nil {
 		t.Fatalf("Start(%q, %q): %v", command, args, err)
 	}
+
+	// Kill the process directly rather than through the manager, so a bug in
+	// Stop or Close can't leak it. Best effort: once the process has been
+	// reaped, Kill fails harmlessly with os.ErrProcessDone.
+	j, err := m.get(s.ID)
+	if err != nil {
+		t.Fatalf("get(%s): %v", s.ID, err)
+	}
+	t.Cleanup(func() { _ = j.cmd.Process.Kill() })
 	return s
 }
 
