@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -226,6 +228,56 @@ func TestStopFinishedJob(t *testing.T) {
 	}
 }
 
+func TestStopFinishedJobCancelledContext(t *testing.T) {
+	m := newTestManager(t)
+	s := start(t, m, "sh", "-c", "exit 7")
+	waitExit(t, m, s.ID)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	// A finished job has nothing to wait for, so the cancelled context must
+	// not matter. Repeat, since a select choosing between two ready cases
+	// would get it right half the time.
+	for range 20 {
+		got, err := m.Stop(ctx, s.ID)
+		if err != nil {
+			t.Fatalf("Stop with cancelled ctx on a finished job: %v", err)
+		}
+		checkFinal(t, got, Exited, 7, 0)
+	}
+}
+
+func TestStopAfterProcessExitedIsExited(t *testing.T) {
+	m := newTestManager(t)
+	// sh exits at once, but the backgrounded sleep holds the pipe, so Wait
+	// sits in WaitDelay and the job still reads Running for about a second.
+	s := start(t, m, "sh", "-c", "sleep 5 & exit 0")
+	j, err := m.get(s.ID)
+	if err != nil {
+		t.Fatalf("get(%s): %v", s.ID, err)
+	}
+
+	// Wait until sh has exited and been reaped, which is when Signal starts
+	// returning ErrProcessDone, while the job is still Running.
+	deadline := time.Now().Add(testTimeout)
+	for !errors.Is(j.cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+		if time.Now().After(deadline) {
+			t.Fatalf("sh did not exit within %v", testTimeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := j.status(); got.State != Running {
+		t.Fatalf("state = %v before Stop, want RUNNING (still in WaitDelay)", got.State)
+	}
+
+	// Stop lands after the process ended by itself, so it isn't Stopped.
+	got, err := m.Stop(t.Context(), s.ID)
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	checkFinal(t, got, Exited, 0, 0)
+}
+
 func TestStopCancelledContextStillKills(t *testing.T) {
 	m := newTestManager(t)
 	s := start(t, m, "sleep", "30")
@@ -290,5 +342,44 @@ func TestClose(t *testing.T) {
 	}
 	if err := m.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestStartRacingClose(t *testing.T) {
+	m := newTestManager(t)
+
+	// Start jobs from many goroutines while Close runs.
+	const starts = 20
+	var wg sync.WaitGroup
+	ids := make(chan string, starts)
+	for range starts {
+		wg.Go(func() {
+			s, err := m.Start("alice", "sleep", []string{"30"})
+			switch {
+			case err == nil:
+				ids <- s.ID
+			case !errors.Is(err, ErrClosed):
+				t.Errorf("Start: %v", err)
+			}
+		})
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+	close(ids)
+
+	// Every Start either failed with ErrClosed or got its job into the map
+	// before Close took the lock, so Close killed it and waited for it. No
+	// job may still be running.
+	for id := range ids {
+		j, err := m.get(id)
+		if err != nil {
+			t.Fatalf("get(%s): %v", id, err)
+		}
+		t.Cleanup(func() { _ = j.cmd.Process.Kill() })
+		if s := j.status(); s.State != Stopped {
+			t.Errorf("job %s is %v after Close, want STOPPED", id, s.State)
+		}
 	}
 }

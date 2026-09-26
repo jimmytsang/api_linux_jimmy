@@ -38,7 +38,7 @@ type State int
 const (
 	Running State = iota + 1 // command in progress
 	Exited                   // process exited by itself
-	Stopped                  // process was killed by Stop or Close
+	Stopped                  // process was killed by SIGKILL from Stop or Close
 )
 
 func (s State) String() string {
@@ -68,9 +68,13 @@ type Status struct {
 
 // Manager starts jobs and keeps track of them. It is safe for concurrent use.
 type Manager struct {
-	mu     sync.Mutex
-	jobs   map[string]*job
-	closed bool
+	// lifecycle guards closed. Start holds it for reading while it forks, so
+	// Starts run in parallel; Close takes it for writing, so it waits for them.
+	lifecycle sync.RWMutex
+	closed    bool
+
+	mu   sync.Mutex // guards jobs; never held across a fork
+	jobs map[string]*job
 }
 
 func NewManager() *Manager {
@@ -85,12 +89,11 @@ func NewManager() *Manager {
 // library makes no decisions with it; it lives here so a job and its owner are
 // created, stored and (eventually) removed together.
 func (m *Manager) Start(owner, command string, args []string) (Status, error) {
-	// Cheap early check so a closed manager doesn't fork a process just to
-	// kill it. The check after cmd.Start below is the one that closes the race.
-	m.mu.Lock()
-	closed := m.closed
-	m.mu.Unlock()
-	if closed {
+	// Hold lifecycle until the job is in the map, so Close can't run in between
+	// and miss it.
+	m.lifecycle.RLock()
+	defer m.lifecycle.RUnlock()
+	if m.closed {
 		return Status{}, ErrClosed
 	}
 
@@ -121,14 +124,6 @@ func (m *Manager) Start(owner, command string, args []string) (Status, error) {
 	go j.wait()
 
 	m.mu.Lock()
-	if m.closed {
-		// Close ran while we were starting the process, so it didn't see this
-		// job. Kill it here so nothing outlives the manager.
-		m.mu.Unlock()
-		_ = j.kill()
-		<-j.done
-		return Status{}, ErrClosed
-	}
 	m.jobs[j.id] = j
 	m.mu.Unlock()
 
@@ -136,7 +131,8 @@ func (m *Manager) Start(owner, command string, args []string) (Status, error) {
 }
 
 // Stop kills a running job with SIGKILL and waits for it to exit. Stopping a
-// job that has already finished just returns its final status.
+// job that has already finished just returns its final status. If the process
+// exits by itself before the signal lands, the job is Exited, not Stopped.
 //
 // ctx bounds only the wait: once Stop has sent the signal, cancelling ctx
 // doesn't save the job. Its final status is available later through Status.
@@ -154,7 +150,14 @@ func (m *Manager) Stop(ctx context.Context, id string) (Status, error) {
 	case <-j.done:
 		return j.status(), nil
 	case <-ctx.Done():
-		return Status{}, ctx.Err()
+		// select picks at random when both are ready, so check done again:
+		// if the job has finished, its final status wins over ctx.
+		select {
+		case <-j.done:
+			return j.status(), nil
+		default:
+			return Status{}, ctx.Err()
+		}
 	}
 }
 
@@ -183,8 +186,11 @@ func (m *Manager) Output(id string) (io.ReadCloser, error) {
 // every output stream. Start fails with ErrClosed afterwards; the other methods
 // keep working on the jobs that exist.
 func (m *Manager) Close() error {
-	m.mu.Lock()
+	m.lifecycle.Lock() // waits for any Start in progress
 	m.closed = true
+	m.lifecycle.Unlock()
+
+	m.mu.Lock()
 	jobs := slices.Collect(maps.Values(m.jobs))
 	m.mu.Unlock()
 
@@ -223,7 +229,7 @@ type job struct {
 	state         State
 	exitCode      int            // valid once state is not Running
 	signal        syscall.Signal // valid once state is not Running; 0 unless signalled
-	stopRequested bool           // set by kill; decides Stopped vs Exited
+	stopRequested bool           // set by kill; Stopped only if SIGKILL then ends it
 }
 
 // wait runs on its own goroutine for the life of the job. It is the only
@@ -245,7 +251,10 @@ func (j *job) wait() {
 	j.mu.Lock()
 	j.exitCode = code
 	j.signal = sig
-	if j.stopRequested {
+	// Stopped only if our SIGKILL is what ended it. Stop can land after the
+	// process already exited by itself, e.g. while Wait sits in WaitDelay for
+	// a child holding the pipe; that job Exited, and its status must say so.
+	if j.stopRequested && sig == syscall.SIGKILL {
 		j.state = Stopped
 	} else {
 		j.state = Exited
@@ -269,9 +278,9 @@ func (j *job) kill() error {
 	j.stopRequested = true
 	j.mu.Unlock()
 
-	// ErrProcessDone means Wait has already reaped the process and the waiter
-	// is about to record it. os.Process never signals a reaped PID, so there
-	// is no risk of hitting a reused one.
+	// ErrProcessDone means the process already exited and was reaped, so the
+	// waiter will record it as Exited. os.Process never signals a reaped PID,
+	// so there is no risk of hitting a reused one.
 	if err := j.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("kill job %s: %w", j.id, err)
 	}
