@@ -66,7 +66,7 @@ func New(tlsConfig *tls.Config, m *job.Manager, logger *slog.Logger) *Server {
 func newServer(tlsConfig *tls.Config, jobs jobManager, logger *slog.Logger) *Server {
 	svc := &service{jobs: jobs, log: logger}
 	gs := grpc.NewServer(
-		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.Creds(loggingCreds{TransportCredentials: credentials.NewTLS(tlsConfig), log: logger}),
 		grpc.UnaryInterceptor(svc.unaryAuth),
 		grpc.StreamInterceptor(svc.streamAuth),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -192,6 +192,10 @@ func (s *service) StreamJobOutput(req *pb.StreamJobOutputRequest, stream grpc.Se
 		return s.toRPCError(err)
 	}
 	defer r.Close() // the output ended, or Send failed
+	// A stream can last as long as the job, so log it when it opens too, not
+	// only when it ends (the deferred logCall above).
+	s.log.Info("stream opened", "user", u.name, "job_id", req.GetJobId())
+
 	// Read blocks until the job prints something or exits, so this goroutine
 	// can't notice the client leaving. When it leaves (cancel, disconnect or
 	// a failed keepalive), gRPC cancels ctx and AfterFunc calls Close on a

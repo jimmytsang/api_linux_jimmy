@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -40,6 +41,7 @@ type testEnv struct {
 	addr   string
 	srv    *Server
 	jobs   *spyManager
+	logs   *logBuffer // everything the server logged
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -56,7 +58,8 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	jobs := &spyManager{Manager: job.NewManager(), readers: make(chan *spyReader, 100)}
-	srv := newServer(tlsConfig, jobs, slog.New(slog.NewTextHandler(t.Output(), nil)))
+	logs := &logBuffer{}
+	srv := newServer(tlsConfig, jobs, slog.New(slog.NewTextHandler(io.MultiWriter(t.Output(), logs), nil)))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -71,7 +74,52 @@ func newTestEnv(t *testing.T) *testEnv {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return &testEnv{ca: ca, caFile: caFile, addr: lis.Addr().String(), srv: srv, jobs: jobs}
+	return &testEnv{ca: ca, caFile: caFile, addr: lis.Addr().String(), srv: srv, jobs: jobs, logs: logs}
+}
+
+// waitLog fails the test unless the server logs a line containing every one
+// of parts within timeout.
+func (e *testEnv) waitLog(t *testing.T, parts ...string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for line := range strings.Lines(e.logs.String()) {
+			if containsAll(line, parts) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no log line with %q in:\n%s", parts, e.logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func containsAll(s string, parts []string) bool {
+	for _, p := range parts {
+		if !strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// logBuffer collects log output; the server writes it while the test reads.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // dial connects with a fresh client certificate for commonName.
@@ -380,6 +428,36 @@ func TestJobStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuditLogs checks the log lines that show who is doing what, even for
+// calls that never reach a handler or that last as long as a job.
+func TestAuditLogs(t *testing.T) {
+	t.Run("failed handshake", func(t *testing.T) {
+		env := newTestEnv(t)
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool(t, env.ca)} // no client certificate
+		conn, err := grpc.NewClient(env.addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := pb.NewJobWorkerClient(conn).StartJob(t.Context(), &pb.StartJobRequest{Command: "true"}); err == nil {
+			t.Fatal("StartJob without a client certificate succeeded")
+		}
+		env.waitLog(t, "tls handshake failed", "remote=127.0.0.1:", "certificate")
+	})
+
+	t.Run("stream logged when it opens", func(t *testing.T) {
+		env := newTestEnv(t)
+		c := env.client(t, "jimbob")
+		id := startJob(t, c, "sleep", "60").GetJobId()
+		// The job prints nothing, so the stream stays open: the only log line
+		// can be the one written when it opened.
+		if _, err := c.StreamJobOutput(t.Context(), &pb.StreamJobOutputRequest{JobId: id}); err != nil {
+			t.Fatal(err)
+		}
+		env.waitLog(t, "stream opened", "user=jimbob", "job_id="+id)
+	})
 }
 
 // TestToRPCError covers the mappings the API tests can't reach reliably, such
