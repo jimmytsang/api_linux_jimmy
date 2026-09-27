@@ -332,7 +332,10 @@ message JobStatus {
 | --- | --- |
 | Empty command or job ID, executable not found | `InvalidArgument` |
 | Unknown job ID, or another user's job | `NotFound` |
+| Certificate with no CN | `Unauthenticated` |
 | Valid certificate but unknown user | `PermissionDenied` |
+| `StopJob` caller cancelled or timed out before the job exited | `Canceled` / `DeadlineExceeded` |
+| `StartJob` while the server is shutting down | `Unavailable` |
 | Anything unexpected | `Internal` (details are logged, not returned) |
 
 Another user's job returns `NotFound` rather than `PermissionDenied`, so users
@@ -410,7 +413,8 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
 - **Keepalive pings** detect dead clients on streams that are idle because the
   job isn't printing anything.
 - **Shutdown:** kill all jobs first, so every stream ends, then stop the gRPC
-  server gracefully.
+  server gracefully. If calls are still running after 10 seconds (e.g. a stream
+  stuck sending to a client that stopped reading), close every connection.
 
 ## CLI UX
 
@@ -511,8 +515,9 @@ cmd/worker/          CLI
 cmd/worker-server/   server
 pkg/job/             library
 internal/server/     gRPC handlers, TLS, authentication, authorization
+internal/certgen/    issues certificates for certs/ and for tests
 proto/ + gen/        .proto and generated code
-certs/               dev certificates
+certs/               dev certificates, and gen.go that writes them
 docs/design.md
 ```
 

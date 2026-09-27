@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package jobworker.v1;
+
+option go_package = "github.com/jimmytsang/api_linux_jimmy/gen/jobworker/v1;jobworkerv1";
+
+// Generated code lives in gen/ and is committed. To regenerate, from the repo
+// root, with protoc v36.2, protoc-gen-go v1.36.12, protoc-gen-go-grpc v1.6.2:
+//
+//   protoc -I proto \
+//     --go_out=gen --go_opt=paths=source_relative \
+//     --go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+//     proto/jobworker/v1/jobworker.proto
+
+// JobWorker runs Linux processes ("jobs") for remote users. Every call is
+// authenticated by the client certificate; users see only their own jobs
+// unless they are an admin.
+service JobWorker {
+  // Starts a job and returns its initial status, including the job ID.
+  rpc StartJob(StartJobRequest) returns (StartJobResponse);
+  // Kills a running job with SIGKILL and returns its final status. Stopping a
+  // finished job just returns its final status.
+  rpc StopJob(StopJobRequest) returns (StopJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  // Streams output from the first byte. Ends when the job exits.
+  rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputResponse);
+}
+
+// Each RPC has its own request and response so they can change independently.
+message StartJobRequest {
+  // Executable name (looked up in PATH) or path. Run directly, not by a shell.
+  string command = 1;
+  repeated string args = 2;
+}
+message StartJobResponse {
+  JobStatus status = 1;
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+message StopJobResponse {
+  JobStatus status = 1;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+message GetJobStatusResponse {
+  JobStatus status = 1;
+}
+
+message StreamJobOutputRequest {
+  string job_id = 1;
+}
+message StreamJobOutputResponse {
+  bytes data = 1; // raw bytes, binary safe, up to 32 KiB per message
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_RUNNING = 1;
+  JOB_STATE_EXITED = 2;
+  JOB_STATE_STOPPED = 3;
+}
+
+message JobStatus {
+  string job_id = 1;
+  string owner = 2;
+  string command = 3;
+  repeated string args = 4;
+  JobState state = 5;
+  // Absent while the job is running. Set once it reaches EXITED or STOPPED;
+  // -1 if the process was terminated by a signal.
+  optional int32 exit_code = 6;
+  // Set only when a signal terminated the process: its number, e.g. 9 for
+  // SIGKILL (Stop, or the OOM killer) or 11 for SIGSEGV (a crash).
+  optional int32 signal = 7;
+}
