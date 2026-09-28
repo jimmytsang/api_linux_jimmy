@@ -347,18 +347,21 @@ func TestErrors(t *testing.T) {
 	missingCert[3] = "/no/such.crt" // the value of --cert
 
 	tests := []struct {
-		name         string
-		args         []string
-		wantStderr   string // prefix
-		wantContains string
+		name       string
+		args       []string
+		wantStderr string // prefix
+		notStderr  string // must not appear
 	}{
 		{"unknown job", env.flags("jimmy", "status", "NOSUCHJOB"), "error: job not found\n", ""},
 		{"stop unknown job", env.flags("jimmy", "stop", "NOSUCHJOB"), "error: job not found\n", ""},
 		{"output unknown job", env.flags("jimmy", "output", "NOSUCHJOB"), "error: job not found\n", ""},
 		{"executable not found", env.flags("jimmy", "start", "--", "no-such-command-8f3a"), `error: executable "no-such-command-8f3a" not found` + "\n", ""},
 		// The server refuses an unknown user during the TLS handshake, so the
-		// error comes from the connection, not from a handler.
-		{"unknown user", env.flags("mallory", "status", "NOSUCHJOB"), "error: ", "bad certificate"},
+		// call never reaches a handler, which would say "job not found". The
+		// wording varies: in TLS 1.3 the client may read the "bad
+		// certificate" alert or first hit the closed connection ("broken
+		// pipe"), so only the server's log has the reason for certain.
+		{"unknown user", env.flags("mallory", "status", "NOSUCHJOB"), "error: ", "job not found"},
 		{"missing certificate", missingCert, "error: load key pair: open /no/such.crt", ""},
 		{"server not running", notRunning, "error: ", ""},
 	}
@@ -376,8 +379,8 @@ func TestErrors(t *testing.T) {
 			if !strings.HasPrefix(stderr.String(), tt.wantStderr) || strings.Contains(stderr.String(), "rpc error") {
 				t.Errorf("stderr = %q, want it to start with %q and not contain the raw rpc error", stderr.String(), tt.wantStderr)
 			}
-			if !strings.Contains(stderr.String(), tt.wantContains) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantContains)
+			if tt.notStderr != "" && strings.Contains(stderr.String(), tt.notStderr) {
+				t.Errorf("stderr = %q, want it not to contain %q", stderr.String(), tt.notStderr)
 			}
 		})
 	}
