@@ -109,7 +109,7 @@ func TestCommandLine(t *testing.T) {
 }
 
 func TestParseArgs(t *testing.T) {
-	defaults := invocation{server: "localhost:50051", cert: "certs/jimmy.crt", key: "certs/jimmy.key", ca: "certs/ca.crt"}
+	defaults := invocation{server: "127.0.0.1:50051", cert: "certs/jimmy.crt", key: "certs/jimmy.key", ca: "certs/ca.crt"}
 	with := func(f func(*invocation)) invocation {
 		inv := defaults
 		f(&inv)
@@ -431,10 +431,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	// Dial by name, as the CLI's default does, so the server certificate is
-	// checked against "localhost".
-	port := lis.Addr().(*net.TCPAddr).Port
-	return &testEnv{addr: fmt.Sprintf("localhost:%d", port), dir: dir}
+	// Dial the address the listener bound, as the CLI's default does.
+	return &testEnv{addr: lis.Addr().String(), dir: dir}
 }
 
 // flags returns a command line that runs as user against the test server.

@@ -81,7 +81,10 @@ type invocation struct {
 func newFlagSet(inv *invocation) *flag.FlagSet {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // run prints errors and usage itself
-	fs.StringVar(&inv.server, "server", "localhost:50051", "server address")
+	// The default is the exact address worker-server binds, not "localhost":
+	// that can resolve to ::1 first, and when the server then rejects our
+	// certificate, gRPC reports the ::1 "connection refused" instead.
+	fs.StringVar(&inv.server, "server", "127.0.0.1:50051", "server address")
 	fs.StringVar(&inv.cert, "cert", "certs/jimmy.crt", "client certificate; its common name is the user")
 	fs.StringVar(&inv.key, "key", "certs/jimmy.key", "client certificate's private key")
 	fs.StringVar(&inv.ca, "ca", "certs/ca.crt", "CA that must have signed the server certificate")

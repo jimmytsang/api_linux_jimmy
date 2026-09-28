@@ -51,7 +51,7 @@ worker [flags] status <job-id>                show a job's status
 worker [flags] output <job-id>                stream a job's output until it ends
 worker [flags] stop <job-id>                  stop a job and show its final status
 
---server  server address (default localhost:50051)
+--server  server address (default 127.0.0.1:50051)
 --cert    client certificate; its common name is the user (default certs/jimmy.crt)
 --key     client certificate's private key (default certs/jimmy.key)
 --ca      CA that must have signed the server certificate (default certs/ca.crt)

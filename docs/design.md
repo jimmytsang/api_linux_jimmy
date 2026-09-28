@@ -432,7 +432,7 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
 ## CLI UX
 
 The CLI uses the standard library `flag` package. Its certificate flags default
-to the dev certificates (`--server localhost:50051 --cert certs/jimmy.crt ...`).
+to the dev certificates (`--server 127.0.0.1:50051 --cert certs/jimmy.crt ...`).
 
 ```console
 # Start a job; everything after -- belongs to the job
