@@ -33,6 +33,10 @@ func TestServerTLSConfig(t *testing.T) {
 	expired.NotAfter = time.Now().Add(-time.Hour)
 	serverUsage := client
 	serverUsage.Usage = x509.ExtKeyUsageServerAuth
+	unknownUser := client
+	unknownUser.CommonName = "mallory"
+	noCommonName := client
+	noCommonName.CommonName = ""
 
 	tests := []struct {
 		name       string
@@ -46,6 +50,8 @@ func TestServerTLSConfig(t *testing.T) {
 		{"expired", clientConfig(t, ca, expired, caFile), isInvalid(x509.Expired)},
 		{"server certificate as client", clientConfig(t, ca, serverUsage, caFile), isInvalid(x509.IncompatibleUsage)},
 		{"TLS 1.2 only", maxTLS12(clientConfig(t, ca, client, caFile)), errContains("unsupported versions")},
+		{"unknown user", clientConfig(t, ca, unknownUser, caFile), isErr(errUnknownUser)},
+		{"no common name", clientConfig(t, ca, noCommonName, caFile), isErr(errNoCommonName)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -214,6 +220,10 @@ func isInvalid(reason x509.InvalidReason) func(error) bool {
 		var e x509.CertificateInvalidError
 		return errors.As(err, &e) && e.Reason == reason
 	}
+}
+
+func isErr(target error) func(error) bool {
+	return func(err error) bool { return errors.Is(err, target) }
 }
 
 // errContains is for the handshake failures crypto/tls has no error type for.

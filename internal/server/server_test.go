@@ -44,7 +44,8 @@ type testEnv struct {
 	logs   *logBuffer // everything the server logged
 }
 
-func newTestEnv(t *testing.T) *testEnv {
+// newTestEnv starts a server. Each tweak changes its TLS config first.
+func newTestEnv(t *testing.T, tweaks ...func(*tls.Config)) *testEnv {
 	t.Helper()
 	ca := newCA(t)
 	caFile := writeFile(t, "ca.crt", ca.CertPEM)
@@ -56,6 +57,9 @@ func newTestEnv(t *testing.T) *testEnv {
 	tlsConfig, err := ServerTLSConfig(certFile, keyFile, caFile)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, tweak := range tweaks {
+		tweak(tlsConfig)
 	}
 	jobs := &spyManager{Manager: job.NewManager(), readers: make(chan *spyReader, 100)}
 	logs := &logBuffer{}
@@ -444,7 +448,7 @@ func TestAuditLogs(t *testing.T) {
 		if _, err := pb.NewJobWorkerClient(conn).StartJob(t.Context(), &pb.StartJobRequest{Command: "true"}); err == nil {
 			t.Fatal("StartJob without a client certificate succeeded")
 		}
-		env.waitLog(t, "tls handshake failed", "remote=127.0.0.1:", "certificate")
+		env.waitLog(t, "connection rejected", "remote=127.0.0.1:", "certificate")
 	})
 
 	t.Run("stream logged when it opens", func(t *testing.T) {

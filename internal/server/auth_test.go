@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/tls"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -60,33 +62,58 @@ func TestAuthorization(t *testing.T) {
 }
 
 // TestAuthentication covers certificates signed by our CA that still don't
-// identify a known user, through both interceptors: unary and stream.
+// identify a known user. They are refused when the connection is made, so no
+// call of any kind reaches a handler, and the refusal is logged.
 func TestAuthentication(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
 	tests := []struct {
 		name       string
 		commonName string
-		want       codes.Code
+		wantLog    string // "" means the user is let in
 	}{
-		{"known user", "jimbob", codes.OK},
-		{"unknown user", "mallory", codes.PermissionDenied},
-		{"no common name", "", codes.Unauthenticated},
+		{"known user", "jimbob", ""},
+		{"unknown user", "mallory", `unknown user \"mallory\"`},
+		{"no common name", "", "no common name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := env.client(t, tt.commonName)
-			resp, err := c.StartJob(ctx, &pb.StartJobRequest{Command: "true"})
-			if got := status.Code(err); got != tt.want {
-				t.Errorf("StartJob code = %v, want %v", got, tt.want)
-			}
-			// The interceptor rejects before the handler looks at the ID, so a
-			// rejected user's empty ID doesn't matter; a known user streams
-			// the job just started.
-			_, err = streamAll(ctx, c, resp.GetStatus().GetJobId())
-			if got := status.Code(err); got != tt.want {
-				t.Errorf("StreamJobOutput code = %v, want %v", got, tt.want)
-			}
+			env := newTestEnv(t)
+			// verifyUser refuses during the handshake itself, so the client
+			// is told why rather than seeing the connection just close.
+			checkAuthentication(t, env, env.client(t, tt.commonName), tt.wantLog, "tls: bad certificate")
 		})
 	}
+}
+
+// TestAuthenticationFailsClosed checks serverCreds refuse an unknown user even
+// if the TLS config lets the handshake through, i.e. without verifyUser.
+func TestAuthenticationFailsClosed(t *testing.T) {
+	env := newTestEnv(t, func(c *tls.Config) { c.VerifyConnection = nil })
+	// Without verifyUser the handshake itself succeeds, so the client only
+	// sees the connection close; what matters is that it is still refused.
+	checkAuthentication(t, env, env.client(t, "mallory"), `unknown user \"mallory\"`, "")
+}
+
+// checkAuthentication makes a unary call and a streaming call and checks both
+// succeed, or, if wantLog is set, that the connection is refused, the client's
+// error mentions wantClient, and the server logs why.
+func checkAuthentication(t *testing.T, env *testEnv, c pb.JobWorkerClient, wantLog, wantClient string) {
+	t.Helper()
+	ctx := t.Context()
+	resp, errStart := c.StartJob(ctx, &pb.StartJobRequest{Command: "true"})
+	_, errStream := streamAll(ctx, c, resp.GetStatus().GetJobId())
+	if wantLog == "" {
+		if errStart != nil || errStream != nil {
+			t.Fatalf("StartJob: %v, StreamJobOutput: %v; want both to succeed", errStart, errStream)
+		}
+		return
+	}
+	for name, err := range map[string]error{"StartJob": errStart, "StreamJobOutput": errStream} {
+		if got := status.Code(err); got != codes.Unavailable {
+			t.Errorf("%s code = %v (%v), want %v", name, got, err, codes.Unavailable)
+		}
+		if !strings.Contains(status.Convert(err).Message(), wantClient) {
+			t.Errorf("%s error = %v, want it to mention %q", name, err, wantClient)
+		}
+	}
+	env.waitLog(t, "connection rejected", wantLog)
 }

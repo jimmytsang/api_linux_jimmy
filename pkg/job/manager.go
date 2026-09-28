@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -25,6 +26,9 @@ var (
 	ErrNotFound = errors.New("job not found")
 	// ErrClosed is returned by Start once the manager has been closed.
 	ErrClosed = errors.New("job manager closed")
+	// ErrExecutableNotFound is returned by Start when the command names no
+	// executable: a bare name that isn't in PATH, or a path that doesn't exist.
+	ErrExecutableNotFound = errors.New("executable not found")
 )
 
 // waitDelay is how long cmd.Wait waits for the output pipe to close after the
@@ -108,6 +112,11 @@ func (m *Manager) Start(owner, command string, args []string) (Status, error) {
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	cmd.WaitDelay = waitDelay
 	if err := cmd.Start(); err != nil {
+		// Classify the failure here, so callers never need to know jobs are
+		// started with os/exec. The original error stays in the chain.
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			return Status{}, fmt.Errorf("start %q: %w: %w", command, ErrExecutableNotFound, err)
+		}
 		return Status{}, fmt.Errorf("start %q: %w", command, err)
 	}
 

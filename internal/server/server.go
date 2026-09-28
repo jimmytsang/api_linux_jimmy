@@ -8,10 +8,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
-	"os/exec"
 	"slices"
 	"time"
 
@@ -66,9 +64,7 @@ func New(tlsConfig *tls.Config, m *job.Manager, logger *slog.Logger) *Server {
 func newServer(tlsConfig *tls.Config, jobs jobManager, logger *slog.Logger) *Server {
 	svc := &service{jobs: jobs, log: logger}
 	gs := grpc.NewServer(
-		grpc.Creds(loggingCreds{TransportCredentials: credentials.NewTLS(tlsConfig), log: logger}),
-		grpc.UnaryInterceptor(svc.unaryAuth),
-		grpc.StreamInterceptor(svc.streamAuth),
+		grpc.Creds(serverCreds{TransportCredentials: credentials.NewTLS(tlsConfig), log: logger}),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    keepaliveTime,
 			Timeout: keepaliveTimeout,
@@ -109,8 +105,8 @@ func (s *Server) Shutdown() {
 	}
 }
 
-// service implements the JobWorker RPCs. Every call reaches it through the
-// auth interceptors, which put the user in the context.
+// service implements the JobWorker RPCs. Every call arrives on a connection
+// serverCreds has already authenticated; handlers get its user from userFrom.
 type service struct {
 	pb.UnimplementedJobWorkerServer
 	jobs jobManager
@@ -133,9 +129,7 @@ func (s *service) StartJob(ctx context.Context, req *pb.StartJobRequest) (_ *pb.
 		return nil, status.Error(codes.InvalidArgument, "command is required")
 	}
 	st, err := s.jobs.Start(u.name, req.GetCommand(), req.GetArgs())
-	// exec.ErrNotFound: a bare name that isn't in PATH. fs.ErrNotExist: a
-	// path that doesn't exist.
-	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, job.ErrExecutableNotFound) {
 		return nil, status.Errorf(codes.InvalidArgument, "executable %q not found", req.GetCommand())
 	}
 	if err != nil {

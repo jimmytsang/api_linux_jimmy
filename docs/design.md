@@ -44,7 +44,7 @@ requirements.
 flowchart LR
     CLI["worker CLI"] -- "gRPC over mTLS" --> Auth
     subgraph Server["worker-server (Linux)"]
-        Auth["Auth interceptor<br/>cert → user → role"] --> API["gRPC handlers"]
+        Auth["TLS credentials<br/>cert → user → role"] --> API["gRPC handlers"]
         API --> Lib["pkg/job Manager"]
     end
     Lib -- "starts" --> Proc["job process"]
@@ -332,8 +332,7 @@ message JobStatus {
 | --- | --- |
 | Empty command or job ID, executable not found | `InvalidArgument` |
 | Unknown job ID, or another user's job | `NotFound` |
-| Certificate with no CN | `Unauthenticated` |
-| Valid certificate but unknown user | `PermissionDenied` |
+| Certificate with no CN, or valid certificate but unknown user | Connection refused during the TLS handshake (`Unavailable`, "bad certificate") |
 | `StopJob` caller cancelled or timed out before the job exited | `Canceled` / `DeadlineExceeded` |
 | `StartJob` while the server is shutting down | `Unavailable` |
 | Anything unexpected | `Internal` (details are logged, not returned) |
@@ -373,9 +372,19 @@ Both sides prove who they are with certificates signed by our CA:
 
 ### Authentication
 
-The user is the **Common Name (CN)** of the verified client certificate. A gRPC
-interceptor reads it on every call. Requests from certificates with no CN are
-rejected.
+The user is the **Common Name (CN)** of the verified client certificate. It is
+worked out **once per connection**, during the TLS handshake, since a
+certificate can't change during a connection:
+
+- The server's TLS config checks the CN names a known user
+  (`VerifyConnection`). A certificate with no CN or an unknown user fails the
+  handshake like any other bad certificate, so the client gets a "bad
+  certificate" error and no call ever reaches a handler.
+- The server's gRPC transport credentials attach the user to the connection.
+  Handlers read it from there; there are no auth interceptors.
+- Every refused connection is logged with the client's address and the reason.
+
+Authorization stays per call, because it depends on the job.
 
 ### Authorization
 
@@ -499,8 +508,9 @@ All tests run with `go test -race`.
   silent job is the point: the handler is blocked in `Read` with nothing to
   send, so only the cancellation hook can unblock it, and a broken one hangs the
   test rather than passing by luck. No goroutines should be left behind.
-- **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed;
-  unknown user should get `PermissionDenied`.
+- **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed.
+- **Authentication:** a certificate with no CN or an unknown user should be
+  refused at the handshake, for unary and streaming calls alike, and logged.
 - **mTLS, server side:** a valid client should work. The server should REJECT a client with
   no certificate / a certificate from an untrusted CA / an expired certificate / a
   server certificate used as a client certificate / a client limited to
