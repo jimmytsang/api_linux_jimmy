@@ -441,15 +441,15 @@ $ worker start -- ping -c 3 localhost
 
 # Status: args are joined onto the Command line
 $ worker status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-ID:       7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-Owner:    jimmy
-Command:  ping -c 3 localhost
-State:    RUNNING
+ID:        7GQ2KH5ZC3MJXN4R6T8VWYBDEF
+Owner:     jimmy
+Command:   ping -c 3 localhost
+State:     RUNNING
 
 # Args containing spaces are quoted, so the line shows exactly what ran
 $ worker status M3XR8TQ2ZK7HJWNC4PAB5DVEFY
-Command:  bash -c "sleep 300; echo done"
-State:    RUNNING
+Command:   bash -c "sleep 300; echo done"
+State:     RUNNING
 
 # Stream output from the beginning until the job ends (Ctrl-C stops watching, not the job)
 $ worker output 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
