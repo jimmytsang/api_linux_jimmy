@@ -68,8 +68,10 @@ func lookupUser(cs tls.ConnectionState) (user, error) {
 // verifyUser is the server's tls.Config.VerifyConnection. It runs during the
 // handshake, after the certificate chain is verified, so a certificate from
 // our CA that doesn't name a known user is rejected like any other bad
-// certificate: the client gets a "bad certificate" alert, and the connection
-// never carries a call.
+// certificate: the server sends a "bad certificate" alert and closes the
+// connection, which never carries a call. In TLS 1.3 the client can hit the
+// closed connection before it reads the alert, so it may see a broken pipe
+// instead; the server's log always has the reason.
 func verifyUser(cs tls.ConnectionState) error {
 	_, err := lookupUser(cs)
 	return err

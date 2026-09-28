@@ -332,7 +332,7 @@ message JobStatus {
 | --- | --- |
 | Empty command or job ID, executable not found | `InvalidArgument` |
 | Unknown job ID, or another user's job | `NotFound` |
-| Certificate with no CN, or valid certificate but unknown user | Connection refused during the TLS handshake (`Unavailable`, "bad certificate") |
+| Certificate with no CN, or valid certificate but unknown user | Connection refused during the TLS handshake (`Unavailable`, usually "bad certificate"; see [Authentication](#authentication)) |
 | `StopJob` caller cancelled or timed out before the job exited | `Canceled` / `DeadlineExceeded` |
 | `StartJob` while the server is shutting down | `Unavailable` |
 | Anything unexpected | `Internal` (details are logged, not returned) |
@@ -378,8 +378,11 @@ certificate can't change during a connection:
 
 - The server's TLS config checks the CN names a known user
   (`VerifyConnection`). A certificate with no CN or an unknown user fails the
-  handshake like any other bad certificate, so the client gets a "bad
-  certificate" error and no call ever reaches a handler.
+  handshake like any other bad certificate, and no call ever reaches a
+  handler. The client usually gets a "bad certificate" error. In TLS 1.3,
+  though, the client's side of the handshake finishes before the server checks
+  the certificate, so the client can hit the closed connection first and see
+  a broken pipe or reset instead. The server's log always records the reason.
 - The server's gRPC transport credentials attach the user to the connection.
   Handlers read it from there; there are no auth interceptors.
 - Every refused connection is logged with the client's address and the reason.

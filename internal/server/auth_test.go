@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/tls"
-	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -77,9 +76,7 @@ func TestAuthentication(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newTestEnv(t)
-			// verifyUser refuses during the handshake itself, so the client
-			// is told why rather than seeing the connection just close.
-			checkAuthentication(t, env, env.client(t, tt.commonName), tt.wantLog, "tls: bad certificate")
+			checkAuthentication(t, env, env.client(t, tt.commonName), tt.wantLog)
 		})
 	}
 }
@@ -90,13 +87,18 @@ func TestAuthenticationFailsClosed(t *testing.T) {
 	env := newTestEnv(t, func(c *tls.Config) { c.VerifyConnection = nil })
 	// Without verifyUser the handshake itself succeeds, so the client only
 	// sees the connection close; what matters is that it is still refused.
-	checkAuthentication(t, env, env.client(t, "mallory"), `unknown user \"mallory\"`, "")
+	checkAuthentication(t, env, env.client(t, "mallory"), `unknown user \"mallory\"`)
 }
 
 // checkAuthentication makes a unary call and a streaming call and checks both
-// succeed, or, if wantLog is set, that the connection is refused, the client's
-// error mentions wantClient, and the server logs why.
-func checkAuthentication(t *testing.T, env *testEnv, c pb.JobWorkerClient, wantLog, wantClient string) {
+// succeed, or, if wantLog is set, that the connection is refused and the
+// server logs why.
+//
+// Only the server knows the reason for certain. In TLS 1.3 the client's
+// handshake is done before the server checks its certificate, so the client
+// may read the "bad certificate" alert, or first hit the connection the server
+// closed ("broken pipe", "connection reset"). Which one it sees is timing.
+func checkAuthentication(t *testing.T, env *testEnv, c pb.JobWorkerClient, wantLog string) {
 	t.Helper()
 	ctx := t.Context()
 	resp, errStart := c.StartJob(ctx, &pb.StartJobRequest{Command: "true"})
@@ -110,9 +112,6 @@ func checkAuthentication(t *testing.T, env *testEnv, c pb.JobWorkerClient, wantL
 	for name, err := range map[string]error{"StartJob": errStart, "StreamJobOutput": errStream} {
 		if got := status.Code(err); got != codes.Unavailable {
 			t.Errorf("%s code = %v (%v), want %v", name, got, err, codes.Unavailable)
-		}
-		if !strings.Contains(status.Convert(err).Message(), wantClient) {
-			t.Errorf("%s error = %v, want it to mention %q", name, err, wantClient)
 		}
 	}
 	env.waitLog(t, "connection rejected", wantLog)
