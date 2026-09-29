@@ -27,16 +27,31 @@ const (
 	// chunkSize caps each StreamJobOutput message.
 	chunkSize = 32 << 10
 
-	// The server pings a client after keepaliveTime without any traffic and
+	// Each side pings the other after keepaliveTime without any traffic and
 	// drops the connection if the ping isn't answered within keepaliveTimeout.
-	// That is how a stream on a job that prints nothing notices its client
-	// has vanished: the stream's context is cancelled, which closes its reader.
+	// On a stream of a job that prints nothing, pings are the only traffic:
+	// the server's pings tell it the client has vanished (the stream's context
+	// is cancelled, which closes its reader), and the client's pings, with
+	// ClientKeepalive, tell it the server has.
 	keepaliveTime    = 30 * time.Second
 	keepaliveTimeout = 10 * time.Second
+	// minClientPing is the most often the server lets a client ping. gRPC's
+	// default is every 5 minutes, and it drops clients that ping more often
+	// (GOAWAY too_many_pings). Half of keepaliveTime leaves room for timing
+	// jitter.
+	minClientPing = keepaliveTime / 2
 
 	// shutdownTimeout bounds how long Shutdown waits for calls in flight.
 	shutdownTimeout = 10 * time.Second
 )
+
+// ClientKeepalive is how clients should ping the server, with
+// grpc.WithKeepaliveParams. It lives next to the server's own settings so the
+// two can't drift apart.
+var ClientKeepalive = keepalive.ClientParameters{
+	Time:    keepaliveTime,
+	Timeout: keepaliveTimeout,
+}
 
 // jobManager is the part of *job.Manager the server uses. Tests wrap the real
 // manager to watch the readers the stream handler opens and closes.
@@ -68,6 +83,9 @@ func newServer(tlsConfig *tls.Config, jobs jobManager, logger *slog.Logger) *Ser
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    keepaliveTime,
 			Timeout: keepaliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime: minClientPing,
 		}),
 	)
 	pb.RegisterJobWorkerServer(gs, svc)
@@ -232,7 +250,8 @@ func (s *service) authorize(u user, id string) (job.Status, error) {
 	if err != nil {
 		return job.Status{}, s.toRPCError(err)
 	}
-	if !u.canAccess(st.Owner) {
+	// Admins can access every job; everyone else only the jobs they started.
+	if u.role != roleAdmin && u.name != st.Owner {
 		return job.Status{}, errJobNotFound
 	}
 	return st, nil

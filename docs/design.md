@@ -332,7 +332,7 @@ message JobStatus {
 | --- | --- |
 | Empty command or job ID, executable not found | `InvalidArgument` |
 | Unknown job ID, or another user's job | `NotFound` |
-| Certificate with no CN, or valid certificate but unknown user | Connection refused during the TLS handshake (`Unavailable`, usually "bad certificate"; see [Authentication](#authentication)) |
+| Certificate with no CN, or valid certificate but unknown user | Connection closed right after the TLS handshake (`Unavailable`; the server logs why, see [Authentication](#authentication)) |
 | `StopJob` caller cancelled or timed out before the job exited | `Canceled` / `DeadlineExceeded` |
 | `StartJob` while the server is shutting down | `Unavailable` |
 | Anything unexpected | `Internal` (details are logged, not returned) |
@@ -373,18 +373,15 @@ Both sides prove who they are with certificates signed by our CA:
 ### Authentication
 
 The user is the **Common Name (CN)** of the verified client certificate. It is
-worked out **once per connection**, during the TLS handshake, since a
-certificate can't change during a connection:
+worked out **once per connection**, right after the TLS handshake, since a
+certificate can't change during a connection. The server's gRPC transport
+credentials do this in one place:
 
-- The server's TLS config checks the CN names a known user
-  (`VerifyConnection`). A certificate with no CN or an unknown user fails the
-  handshake like any other bad certificate, and no call ever reaches a
-  handler. The client usually gets a "bad certificate" error. In TLS 1.3,
-  though, the client's side of the handshake finishes before the server checks
-  the certificate, so the client can hit the closed connection first and see
-  a broken pipe or reset instead. The server's log always records the reason.
-- The server's gRPC transport credentials attach the user to the connection.
-  Handlers read it from there; there are no auth interceptors.
+- A known user is attached to the connection. Handlers read it from there;
+  there are no auth interceptors.
+- A certificate with no CN or an unknown user has its connection closed
+  before it carries a call. The client just sees the connection close
+  (`Unavailable`).
 - Every refused connection is logged with the client's address and the reason.
 
 Authorization stays per call, because it depends on the job.
@@ -422,8 +419,12 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
   stream context, `Close` runs on its own goroutine, sets the reader's closed
   flag and broadcasts, and the blocked `Read` returns. A deferred `Close` covers
   the normal path, where the output simply ends.
-- **Keepalive pings** detect dead clients on streams that are idle because the
-  job isn't printing anything.
+- **Keepalive pings, both ways:** on a stream of a job that prints nothing,
+  pings are the only traffic. The server pings clients to notice one has gone,
+  and clients ping the server (with `server.ClientKeepalive`) to notice it has.
+  Both ping after 30 seconds without traffic and give up after 10 more. The
+  server allows client pings every 15 seconds at most; gRPC's default of 5
+  minutes would drop the client.
 - **Shutdown:** kill all jobs first, so every stream ends, then stop the gRPC
   server gracefully. If calls are still running after 10 seconds (e.g. a stream
   stuck sending to a client that stopped reading), close every connection.
@@ -510,10 +511,13 @@ All tests run with `go test -race`.
   then dropping the client should end the handler and close the reader. The
   silent job is the point: the handler is blocked in `Read` with nothing to
   send, so only the cancellation hook can unblock it, and a broken one hangs the
-  test rather than passing by luck. No goroutines should be left behind.
+  test rather than passing by luck. No goroutines should be left behind,
+  checked with `testing/synctest`.
+- **Concurrent streams:** two users streaming the same job at once should both
+  get the full output.
 - **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed.
-- **Authentication:** a certificate with no CN or an unknown user should be
-  refused at the handshake, for unary and streaming calls alike, and logged.
+- **Authentication:** a certificate with no CN or an unknown user should have
+  its connection refused, for unary and streaming calls alike.
 - **mTLS, server side:** a valid client should work. The server should REJECT a client with
   no certificate / a certificate from an untrusted CA / an expired certificate / a
   server certificate used as a client certificate / a client limited to

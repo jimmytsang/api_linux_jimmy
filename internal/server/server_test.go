@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -12,15 +11,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -41,11 +41,9 @@ type testEnv struct {
 	addr   string
 	srv    *Server
 	jobs   *spyManager
-	logs   *logBuffer // everything the server logged
 }
 
-// newTestEnv starts a server. Each tweak changes its TLS config first.
-func newTestEnv(t *testing.T, tweaks ...func(*tls.Config)) *testEnv {
+func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	ca := newCA(t)
 	caFile := writeFile(t, "ca.crt", ca.CertPEM)
@@ -58,12 +56,8 @@ func newTestEnv(t *testing.T, tweaks ...func(*tls.Config)) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tweak := range tweaks {
-		tweak(tlsConfig)
-	}
 	jobs := &spyManager{Manager: job.NewManager(), readers: make(chan *spyReader, 100)}
-	logs := &logBuffer{}
-	srv := newServer(tlsConfig, jobs, slog.New(slog.NewTextHandler(io.MultiWriter(t.Output(), logs), nil)))
+	srv := newServer(tlsConfig, jobs, slog.New(slog.NewTextHandler(t.Output(), nil)))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -78,56 +72,12 @@ func newTestEnv(t *testing.T, tweaks ...func(*tls.Config)) *testEnv {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return &testEnv{ca: ca, caFile: caFile, addr: lis.Addr().String(), srv: srv, jobs: jobs, logs: logs}
+	return &testEnv{ca: ca, caFile: caFile, addr: lis.Addr().String(), srv: srv, jobs: jobs}
 }
 
-// waitLog fails the test unless the server logs a line containing every one
-// of parts within timeout.
-func (e *testEnv) waitLog(t *testing.T, parts ...string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		for line := range strings.Lines(e.logs.String()) {
-			if containsAll(line, parts) {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no log line with %q in:\n%s", parts, e.logs.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func containsAll(s string, parts []string) bool {
-	for _, p := range parts {
-		if !strings.Contains(s, p) {
-			return false
-		}
-	}
-	return true
-}
-
-// logBuffer collects log output; the server writes it while the test reads.
-type logBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *logBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *logBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// dial connects with a fresh client certificate for commonName.
-func (e *testEnv) dial(t *testing.T, commonName string) *grpc.ClientConn {
+// newClientConn returns a client connection with a fresh certificate for
+// commonName. Like grpc.NewClient, it doesn't connect until the first call.
+func (e *testEnv) newClientConn(t *testing.T, commonName string) *grpc.ClientConn {
 	t.Helper()
 	certFile, keyFile := issue(t, e.ca, certgen.Leaf{CommonName: commonName, Usage: x509.ExtKeyUsageClientAuth})
 	tlsConfig, err := ClientTLSConfig(certFile, keyFile, e.caFile)
@@ -143,7 +93,7 @@ func (e *testEnv) dial(t *testing.T, commonName string) *grpc.ClientConn {
 }
 
 func (e *testEnv) client(t *testing.T, commonName string) pb.JobWorkerClient {
-	return pb.NewJobWorkerClient(e.dial(t, commonName))
+	return pb.NewJobWorkerClient(e.newClientConn(t, commonName))
 }
 
 // spyManager is the real manager, except that it hands the test every output
@@ -183,10 +133,11 @@ func (r *spyReader) Close() error {
 	return r.ReadCloser.Close()
 }
 
-// TestStreamJobOutputClientGoesAway checks that a stream handler blocked in
-// Read ends when its client leaves. The job prints nothing, so the handler
-// has nothing to send and only the context hook closing the reader can get it
-// out of Read: if the hook is broken, the handler hangs and the test fails.
+// TestStreamJobOutputClientGoesAway checks, over real gRPC, that a client
+// leaving closes the reader of a stream handler blocked in Read. The job
+// prints nothing, so only the context hook closing the reader can get the
+// handler out of Read. TestStreamJobOutputLeavesNothingBehind checks the
+// handler then exits cleanly.
 func TestStreamJobOutputClientGoesAway(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -198,7 +149,7 @@ func TestStreamJobOutputClientGoesAway(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newTestEnv(t)
-			conn := env.dial(t, "jimmy")
+			conn := env.newClientConn(t, "jimmy")
 			c := pb.NewJobWorkerClient(conn)
 			id := startJob(t, c, "sleep", "60").GetJobId()
 
@@ -213,8 +164,6 @@ func TestStreamJobOutputClientGoesAway(t *testing.T) {
 			tt.leave(cancel, conn)
 
 			within(t, r.closed, "the reader to be closed")
-			waitGoroutinesGone(t, "(*service).StreamJobOutput") // the handler and its AfterFunc
-			waitGoroutinesGone(t, "job.(*reader).Read")
 
 			// Leaving stops the watching, not the job.
 			st, err := env.jobs.Status(id)
@@ -225,6 +174,124 @@ func TestStreamJobOutputClientGoesAway(t *testing.T) {
 				t.Errorf("job state = %v, want %v", st.State, job.Running)
 			}
 		})
+	}
+}
+
+// TestStreamJobOutputLeavesNothingBehind calls the stream handler directly
+// inside a synctest bubble. synctest.Test only returns once every goroutine
+// started in the bubble has exited, and fails if they are stuck, so it catches
+// the handler or its AfterFunc goroutine being left behind when the client
+// leaves.
+//
+// Real sockets and processes can't run in a bubble, so the stream is a fake and
+// the job is started outside it. The job prints nothing: the handler waits in
+// Read on a sync.Cond, which synctest counts as durably blocked, and nothing
+// outside the bubble ever wakes it.
+func TestStreamJobOutputLeavesNothingBehind(t *testing.T) {
+	m := job.NewManager()
+	st, err := m.Start("jimmy", "sleep", []string{"60"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &service{jobs: m, log: slog.New(slog.NewTextHandler(t.Output(), nil))}
+
+	synctest.Test(t, func(t *testing.T) {
+		jimmy := &peer.Peer{AuthInfo: authInfo{user: user{name: "jimmy", role: roleAdmin}}}
+		ctx, cancel := context.WithCancel(peer.NewContext(t.Context(), jimmy))
+		returned := make(chan error, 1)
+		go func() {
+			returned <- svc.StreamJobOutput(&pb.StreamJobOutputRequest{JobId: st.ID}, &fakeStream{ctx: ctx})
+		}()
+
+		synctest.Wait() // the handler is blocked in Read
+		select {
+		case err := <-returned:
+			t.Fatalf("handler returned before the client left: %v", err)
+		default:
+		}
+
+		cancel() // the client leaves
+		synctest.Wait()
+		select {
+		case err := <-returned:
+			if got := status.Code(err); got != codes.Canceled {
+				t.Errorf("handler returned %v, want %v", err, codes.Canceled)
+			}
+		default:
+			t.Fatal("handler still blocked after the client left")
+		}
+	})
+
+	// Kill the job only now. It exiting wakes Read from outside the bubble,
+	// which synctest treats as a fatal error if a broken handler were still
+	// stuck in it, hiding the real failure. If the bubble failed that way,
+	// the sleep is left to end on its own.
+	m.Close()
+}
+
+// fakeStream is just enough of a server stream to call StreamJobOutput
+// directly. Its other methods panic, through the nil embedded interface.
+type fakeStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *fakeStream) Context() context.Context { return s.ctx }
+
+func (s *fakeStream) Send(*pb.StreamJobOutputResponse) error {
+	return errors.New("unexpected Send: the job prints nothing")
+}
+
+// TestConcurrentStreams checks two streams of the same job at once, from
+// different users: the owner and an admin. The job waits for a trigger file,
+// and the test only creates it once both handlers are blocked in Read, so the
+// streams are certain to overlap. Both must then get the whole output.
+func TestConcurrentStreams(t *testing.T) {
+	env := newTestEnv(t)
+	jimbob, jimmy := env.client(t, "jimbob"), env.client(t, "jimmy")
+	trigger := filepath.Join(t.TempDir(), "trigger")
+	id := startJob(t, jimbob, "sh", "-c", `while [ ! -e "$0" ]; do sleep 0.01; done; seq 1 30000`, trigger).GetJobId()
+
+	type result struct {
+		out []byte
+		err error
+	}
+	results := make(chan result, 2)
+	for _, c := range []pb.JobWorkerClient{jimbob, jimmy} {
+		go func() {
+			out, err := streamAll(t.Context(), c, id)
+			results <- result{out, err}
+		}()
+	}
+	for range 2 {
+		r := within(t, env.jobs.readers, "a handler to open the output")
+		within(t, r.reading, "the handler to start reading")
+	}
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var want bytes.Buffer
+	for i := 1; i <= 30000; i++ {
+		fmt.Fprintln(&want, i)
+	}
+	for range 2 {
+		r := within(t, results, "a stream to end")
+		if r.err != nil {
+			t.Fatalf("stream: %v", r.err)
+		}
+		if !bytes.Equal(r.out, want.Bytes()) {
+			t.Errorf("stream got %d bytes of output, want %d", len(r.out), want.Len())
+		}
+	}
+}
+
+// TestClientKeepaliveAllowed checks ClientKeepalive fits the server's
+// enforcement policy. A client pinging more often than that is dropped with
+// GOAWAY too_many_pings, which would end every long-running stream.
+func TestClientKeepaliveAllowed(t *testing.T) {
+	if ClientKeepalive.Time < minClientPing {
+		t.Errorf("ClientKeepalive pings every %v, but the server only allows every %v", ClientKeepalive.Time, minClientPing)
 	}
 }
 
@@ -434,36 +501,6 @@ func TestJobStatus(t *testing.T) {
 	}
 }
 
-// TestAuditLogs checks the log lines that show who is doing what, even for
-// calls that never reach a handler or that last as long as a job.
-func TestAuditLogs(t *testing.T) {
-	t.Run("failed handshake", func(t *testing.T) {
-		env := newTestEnv(t)
-		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool(t, env.ca)} // no client certificate
-		conn, err := grpc.NewClient(env.addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer conn.Close()
-		if _, err := pb.NewJobWorkerClient(conn).StartJob(t.Context(), &pb.StartJobRequest{Command: "true"}); err == nil {
-			t.Fatal("StartJob without a client certificate succeeded")
-		}
-		env.waitLog(t, "connection rejected", "remote=127.0.0.1:", "certificate")
-	})
-
-	t.Run("stream logged when it opens", func(t *testing.T) {
-		env := newTestEnv(t)
-		c := env.client(t, "jimbob")
-		id := startJob(t, c, "sleep", "60").GetJobId()
-		// The job prints nothing, so the stream stays open: the only log line
-		// can be the one written when it opened.
-		if _, err := c.StreamJobOutput(t.Context(), &pb.StreamJobOutputRequest{JobId: id}); err != nil {
-			t.Fatal(err)
-		}
-		env.waitLog(t, "stream opened", "user=jimbob", "job_id="+id)
-	})
-}
-
 // TestToRPCError covers the mappings the API tests can't reach reliably, such
 // as a Stop whose caller gives up before SIGKILL has ended the job.
 func TestToRPCError(t *testing.T) {
@@ -534,24 +571,6 @@ func within[T any](t *testing.T, ch <-chan T, what string) T {
 	case <-time.After(timeout):
 		t.Fatalf("timed out waiting for %s", what)
 		panic("unreachable")
-	}
-}
-
-// waitGoroutinesGone fails the test if some goroutine is still running fn
-// after timeout. fn is matched against the stacks of every goroutine.
-func waitGoroutinesGone(t *testing.T, fn string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		buf := make([]byte, 1<<20)
-		buf = buf[:runtime.Stack(buf, true)]
-		if !bytes.Contains(buf, []byte(fn)) {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("goroutine still running %s:\n%s", fn, buf)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

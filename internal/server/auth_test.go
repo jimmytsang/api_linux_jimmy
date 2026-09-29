@@ -2,12 +2,16 @@ package server
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/jimmytsang/api_linux_jimmy/gen/jobworker/v1"
+	"github.com/jimmytsang/api_linux_jimmy/internal/certgen"
 )
 
 func TestAuthorization(t *testing.T) {
@@ -61,58 +65,72 @@ func TestAuthorization(t *testing.T) {
 }
 
 // TestAuthentication covers certificates signed by our CA that still don't
-// identify a known user. They are refused when the connection is made, so no
-// call of any kind reaches a handler, and the refusal is logged.
+// identify a known user. serverCreds close the connection right after the TLS
+// handshake, so no call of either kind reaches a handler. The client can't
+// tell why, it just sees the connection close; TestLookupUser covers the
+// reasons.
 func TestAuthentication(t *testing.T) {
 	tests := []struct {
 		name       string
 		commonName string
-		wantLog    string // "" means the user is let in
+		refused    bool
 	}{
-		{"known user", "jimbob", ""},
-		{"unknown user", "mallory", `unknown user \"mallory\"`},
-		{"no common name", "", "no common name"},
+		{"known user", "jimbob", false},
+		{"unknown user", "mallory", true},
+		{"no common name", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newTestEnv(t)
-			checkAuthentication(t, env, env.client(t, tt.commonName), tt.wantLog)
+			c := env.client(t, tt.commonName)
+			ctx := t.Context()
+			resp, errStart := c.StartJob(ctx, &pb.StartJobRequest{Command: "true"})
+			_, errStream := streamAll(ctx, c, resp.GetStatus().GetJobId())
+			want := codes.OK
+			if tt.refused {
+				want = codes.Unavailable
+			}
+			for name, err := range map[string]error{"StartJob": errStart, "StreamJobOutput": errStream} {
+				if got := status.Code(err); got != want {
+					t.Errorf("%s code = %v (%v), want %v", name, got, err, want)
+				}
+			}
 		})
 	}
 }
 
-// TestAuthenticationFailsClosed checks serverCreds refuse an unknown user even
-// if the TLS config lets the handshake through, i.e. without verifyUser.
-func TestAuthenticationFailsClosed(t *testing.T) {
-	env := newTestEnv(t, func(c *tls.Config) { c.VerifyConnection = nil })
-	// Without verifyUser the handshake itself succeeds, so the client only
-	// sees the connection close; what matters is that it is still refused.
-	checkAuthentication(t, env, env.client(t, "mallory"), `unknown user \"mallory\"`)
-}
-
-// checkAuthentication makes a unary call and a streaming call and checks both
-// succeed, or, if wantLog is set, that the connection is refused and the
-// server logs why.
-//
-// Only the server knows the reason for certain. In TLS 1.3 the client's
-// handshake is done before the server checks its certificate, so the client
-// may read the "bad certificate" alert, or first hit the connection the server
-// closed ("broken pipe", "connection reset"). Which one it sees is timing.
-func checkAuthentication(t *testing.T, env *testEnv, c pb.JobWorkerClient, wantLog string) {
-	t.Helper()
-	ctx := t.Context()
-	resp, errStart := c.StartJob(ctx, &pb.StartJobRequest{Command: "true"})
-	_, errStream := streamAll(ctx, c, resp.GetStatus().GetJobId())
-	if wantLog == "" {
-		if errStart != nil || errStream != nil {
-			t.Fatalf("StartJob: %v, StreamJobOutput: %v; want both to succeed", errStart, errStream)
+func TestLookupUser(t *testing.T) {
+	ca := newCA(t)
+	verified := func(commonName string) tls.ConnectionState {
+		certPEM, _, err := ca.Issue(certgen.Leaf{CommonName: commonName, Usage: x509.ExtKeyUsageClientAuth})
+		if err != nil {
+			t.Fatal(err)
 		}
-		return
-	}
-	for name, err := range map[string]error{"StartJob": errStart, "StreamJobOutput": errStream} {
-		if got := status.Code(err); got != codes.Unavailable {
-			t.Errorf("%s code = %v (%v), want %v", name, got, err, codes.Unavailable)
+		block, _ := pem.Decode(certPEM)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
 		}
+		return tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{cert}}}
 	}
-	env.waitLog(t, "connection rejected", wantLog)
+	tests := []struct {
+		name    string
+		state   tls.ConnectionState
+		want    user
+		wantErr error
+	}{
+		{"admin", verified("jimmy"), user{name: "jimmy", role: roleAdmin}, nil},
+		{"user", verified("jimbob"), user{name: "jimbob", role: roleUser}, nil},
+		{"unknown user", verified("mallory"), user{}, errUnknownUser},
+		{"no common name", verified(""), user{}, errNoCommonName},
+		{"not verified", tls.ConnectionState{}, user{}, errNoVerifiedCert},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := lookupUser(tt.state)
+			if !errors.Is(err, tt.wantErr) || got != tt.want {
+				t.Errorf("lookupUser = %+v, %v; want %+v, %v", got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
 }

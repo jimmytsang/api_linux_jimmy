@@ -8,9 +8,10 @@ import (
 )
 
 // ServerTLSConfig returns the server's mTLS config: TLS 1.3 only, and every
-// client must present a certificate signed by the CA in caFile, marked for
-// client use, whose common name is a known user. A client that doesn't fails
-// the handshake, before any RPC runs.
+// client must present a certificate signed by the CA in caFile and marked for
+// client use. A client that doesn't fails the handshake, before any RPC runs.
+// Whether the certificate names a known user is checked right after, by
+// serverCreds.
 func ServerTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	cert, pool, err := loadKeyPairAndCA(certFile, keyFile, caFile)
 	if err != nil {
@@ -21,9 +22,8 @@ func ServerTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		// Verification checks the chain up to ClientCAs and that the
 		// certificate is marked for client auth (ExtKeyUsageClientAuth).
-		ClientAuth:       tls.RequireAndVerifyClientCert,
-		ClientCAs:        pool,
-		VerifyConnection: verifyUser,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:  pool,
 	}, nil
 }
 
