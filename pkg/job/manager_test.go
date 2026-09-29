@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -189,10 +188,12 @@ func TestStartMissingExecutable(t *testing.T) {
 		}
 	}
 
-	// The server maps this to InvalidArgument, so the cause must survive.
-	_, err := m.Start("alice", "no-such-command-jobtest", nil)
-	if !errors.Is(err, exec.ErrNotFound) {
-		t.Errorf("Start err = %v, want it to wrap exec.ErrNotFound", err)
+	// Callers tell this apart from other failures without knowing about
+	// os/exec: the server maps it to InvalidArgument.
+	for _, command := range []string{"no-such-command-jobtest", "/no/such/path"} {
+		if _, err := m.Start("alice", command, nil); !errors.Is(err, ErrExecutableNotFound) {
+			t.Errorf("Start(%q) err = %v, want it to wrap ErrExecutableNotFound", command, err)
+		}
 	}
 }
 

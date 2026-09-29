@@ -44,7 +44,7 @@ requirements.
 flowchart LR
     CLI["worker CLI"] -- "gRPC over mTLS" --> Auth
     subgraph Server["worker-server (Linux)"]
-        Auth["Auth interceptor<br/>cert → user → role"] --> API["gRPC handlers"]
+        Auth["TLS credentials<br/>cert → user → role"] --> API["gRPC handlers"]
         API --> Lib["pkg/job Manager"]
     end
     Lib -- "starts" --> Proc["job process"]
@@ -332,7 +332,9 @@ message JobStatus {
 | --- | --- |
 | Empty command or job ID, executable not found | `InvalidArgument` |
 | Unknown job ID, or another user's job | `NotFound` |
-| Valid certificate but unknown user | `PermissionDenied` |
+| Certificate with no CN, or valid certificate but unknown user | Connection closed right after the TLS handshake (`Unavailable`; the server logs why, see [Authentication](#authentication)) |
+| `StopJob` caller cancelled or timed out before the job exited | `Canceled` / `DeadlineExceeded` |
+| `StartJob` while the server is shutting down | `Unavailable` |
 | Anything unexpected | `Internal` (details are logged, not returned) |
 
 Another user's job returns `NotFound` rather than `PermissionDenied`, so users
@@ -370,9 +372,19 @@ Both sides prove who they are with certificates signed by our CA:
 
 ### Authentication
 
-The user is the **Common Name (CN)** of the verified client certificate. A gRPC
-interceptor reads it on every call. Requests from certificates with no CN are
-rejected.
+The user is the **Common Name (CN)** of the verified client certificate. It is
+worked out **once per connection**, right after the TLS handshake, since a
+certificate can't change during a connection. The server's gRPC transport
+credentials do this in one place:
+
+- A known user is attached to the connection. Handlers read it from there;
+  there are no auth interceptors.
+- A certificate with no CN or an unknown user has its connection closed
+  before it carries a call. The client just sees the connection close
+  (`Unavailable`).
+- Every refused connection is logged with the client's address and the reason.
+
+Authorization stays per call, because it depends on the job.
 
 ### Authorization
 
@@ -407,10 +419,15 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
   stream context, `Close` runs on its own goroutine, sets the reader's closed
   flag and broadcasts, and the blocked `Read` returns. A deferred `Close` covers
   the normal path, where the output simply ends.
-- **Keepalive pings** detect dead clients on streams that are idle because the
-  job isn't printing anything.
+- **Keepalive pings, both ways:** on a stream of a job that prints nothing,
+  pings are the only traffic. The server pings clients to notice one has gone,
+  and clients ping the server (with `server.ClientKeepalive`) to notice it has.
+  Both ping after 30 seconds without traffic and give up after 10 more. The
+  server allows client pings every 15 seconds at most; gRPC's default of 5
+  minutes would drop the client.
 - **Shutdown:** kill all jobs first, so every stream ends, then stop the gRPC
-  server gracefully.
+  server gracefully. If calls are still running after 10 seconds (e.g. a stream
+  stuck sending to a client that stopped reading), close every connection.
 
 ## CLI UX
 
@@ -494,9 +511,13 @@ All tests run with `go test -race`.
   then dropping the client should end the handler and close the reader. The
   silent job is the point: the handler is blocked in `Read` with nothing to
   send, so only the cancellation hook can unblock it, and a broken one hangs the
-  test rather than passing by luck. No goroutines should be left behind.
-- **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed;
-  unknown user should get `PermissionDenied`.
+  test rather than passing by luck. No goroutines should be left behind,
+  checked with `testing/synctest`.
+- **Concurrent streams:** two users streaming the same job at once should both
+  get the full output.
+- **Authorization:** owner should be allowed; other users should get `NotFound`; admin should be allowed.
+- **Authentication:** a certificate with no CN or an unknown user should have
+  its connection refused, for unary and streaming calls alike.
 - **mTLS, server side:** a valid client should work. The server should REJECT a client with
   no certificate / a certificate from an untrusted CA / an expired certificate / a
   server certificate used as a client certificate / a client limited to
@@ -511,8 +532,9 @@ cmd/worker/          CLI
 cmd/worker-server/   server
 pkg/job/             library
 internal/server/     gRPC handlers, TLS, authentication, authorization
+internal/certgen/    issues certificates for certs/ and for tests
 proto/ + gen/        .proto and generated code
-certs/               dev certificates
+certs/               dev certificates, and gen.go that writes them
 docs/design.md
 ```
 
