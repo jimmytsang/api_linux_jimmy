@@ -12,7 +12,10 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	pb "github.com/jimmytsang/api_linux_jimmy/gen/jobworker/v1"
 	"github.com/jimmytsang/api_linux_jimmy/internal/certgen"
@@ -329,7 +332,7 @@ func TestOutputCtrlC(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	stdout := &cancelOnWrite{cancel: cancel}
+	stdout := &onWrite{fn: cancel}
 	var stderr bytes.Buffer
 	code := run(ctx, env.flags("jimmy", "output", id), stdout, &stderr)
 
@@ -347,16 +350,111 @@ func TestOutputCtrlC(t *testing.T) {
 	}
 }
 
-// cancelOnWrite records what the CLI writes and calls cancel on every write,
-// standing in for a user who presses Ctrl-C once output appears.
-type cancelOnWrite struct {
+// onWrite records what the CLI writes and calls fn on every write, to make
+// something happen once output appears, such as the user pressing Ctrl-C.
+type onWrite struct {
 	bytes.Buffer
-	cancel context.CancelFunc
+	fn func()
 }
 
-func (w *cancelOnWrite) Write(p []byte) (int, error) {
-	w.cancel()
+func (w *onWrite) Write(p []byte) (int, error) {
+	w.fn()
 	return w.Buffer.Write(p)
+}
+
+// TestOutputServerVanishes checks that output gives up on a server that has
+// vanished without closing the connection, instead of waiting forever on a job
+// that prints nothing. Nothing is closed, so only the client's keepalive ping
+// going unanswered can tell.
+func TestOutputServerVanishes(t *testing.T) {
+	env := newTestEnv(t)
+	id := env.start(t, "jimmy", "sh", "-c", "echo ready; sleep 60")
+	// gRPC won't ping more often than every 10s; a 1s ping timeout keeps the
+	// test at about 11s.
+	saved := server.ClientKeepalive
+	server.ClientKeepalive.Time, server.ClientKeepalive.Timeout = 10*time.Second, time.Second
+	t.Cleanup(func() { server.ClientKeepalive = saved })
+
+	proxy := newSilentProxy(t, env.addr)
+	args := env.flags("jimmy", "output", id)
+	args[1] = proxy.addr // the value of --server
+	// The server vanishes once output is streaming: the job's first line is in.
+	stdout := &onWrite{fn: func() { proxy.silent.Store(true) }}
+	var stderr bytes.Buffer
+	code := run(t.Context(), args, stdout, &stderr)
+
+	if code != exitError {
+		t.Errorf("exit code = %d, want %d", code, exitError)
+	}
+	if got := stdout.String(); got != "ready\n" {
+		t.Errorf("stdout = %q, want %q", got, "ready\n")
+	}
+	if !strings.HasPrefix(stderr.String(), "error: ") {
+		t.Errorf("stderr = %q, want an error", stderr.String())
+	}
+}
+
+// silentProxy forwards TCP connections to a target until silent is set. From
+// then on it keeps every connection open but drops what either side sends,
+// like a server whose machine has dropped off the network.
+type silentProxy struct {
+	addr   string
+	silent atomic.Bool
+}
+
+func newSilentProxy(t *testing.T, target string) *silentProxy {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &silentProxy{addr: lis.Addr().String()}
+	var mu sync.Mutex
+	var conns []net.Conn
+	// Closing the listener and every connection ends the proxy's goroutines.
+	t.Cleanup(func() {
+		lis.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			client, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			srv, err := net.Dial("tcp", target)
+			if err != nil {
+				client.Close()
+				continue
+			}
+			mu.Lock()
+			conns = append(conns, client, srv)
+			mu.Unlock()
+			go p.forward(srv, client)
+			go p.forward(client, srv)
+		}
+	}()
+	return p
+}
+
+func (p *silentProxy) forward(dst, src net.Conn) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
+		}
+		if p.silent.Load() {
+			continue // dropped
+		}
+		if _, err := dst.Write(buf[:n]); err != nil {
+			return
+		}
+	}
 }
 
 // TestErrors checks that failures print "error: <message>" to stderr, never
@@ -382,11 +480,10 @@ func TestErrors(t *testing.T) {
 		{"stop unknown job", env.flags("jimmy", "stop", "NOSUCHJOB"), "error: job not found\n", ""},
 		{"output unknown job", env.flags("jimmy", "output", "NOSUCHJOB"), "error: job not found\n", ""},
 		{"executable not found", env.flags("jimmy", "start", "--", "no-such-command-8f3a"), `error: executable "no-such-command-8f3a" not found` + "\n", ""},
-		// The server refuses an unknown user during the TLS handshake, so the
-		// call never reaches a handler, which would say "job not found". The
-		// wording varies: in TLS 1.3 the client may read the "bad
-		// certificate" alert or first hit the closed connection ("broken
-		// pipe"), so only the server's log has the reason for certain.
+		// The server closes an unknown user's connection right after the
+		// TLS handshake, so the call never reaches a handler, which would
+		// say "job not found". The client only sees the connection close, so
+		// the wording isn't checked.
 		{"unknown user", env.flags("mallory", "status", "NOSUCHJOB"), "error: ", "job not found"},
 		{"missing certificate", missingCert, "error: load key pair: open /no/such.crt", ""},
 		{"server not running", notRunning, "error: ", ""},

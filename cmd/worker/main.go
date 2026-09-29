@@ -167,10 +167,13 @@ func execute(ctx context.Context, inv invocation, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// No client keepalive on purpose: the server already pings idle
-	// connections, and gRPC's default enforcement on the server drops clients
-	// that ping more often than every 5 minutes (GOAWAY too_many_pings).
-	conn, err := grpc.NewClient(inv.server, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	// Ping the server when the connection goes quiet. On a job that prints
+	// nothing, `output` would otherwise wait forever if the server vanished
+	// without closing the connection: only an unanswered ping notices.
+	conn, err := grpc.NewClient(inv.server,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithKeepaliveParams(server.ClientKeepalive),
+	)
 	if err != nil {
 		return err
 	}
@@ -225,7 +228,12 @@ func streamOutput(ctx context.Context, c pb.JobWorkerClient, id string, stdout i
 	// The stream only ends once the final status is recorded, so this is it.
 	resp, err := c.GetJobStatus(ctx, &pb.GetJobStatusRequest{JobId: id})
 	if err != nil {
-		return streamEnd(ctx, err)
+		if ctx.Err() != nil {
+			return nil // Ctrl-C right as the output ended
+		}
+		// E.g. the server shut down, killing the job and ending the stream,
+		// and was gone before we could ask how the job ended.
+		return fmt.Errorf("output ended, but the job's final status is unavailable: %s", status.Convert(err).Message())
 	}
 	st := resp.GetStatus()
 	if st.GetState() == pb.JobState_JOB_STATE_EXITED && st.GetExitCode() == 0 {
