@@ -432,7 +432,9 @@ without issuing new certificates. TODO: ideally roles should be loaded from a co
 ## CLI UX
 
 The CLI uses the standard library `flag` package. Its certificate flags default
-to the dev certificates (`--server localhost:50051 --cert certs/jimmy.crt ...`).
+to the least privileged dev user (`--server 127.0.0.1:50051 --cert
+certs/jimbob.crt ...`); acting as the admin takes `--cert certs/jimmy.crt --key
+certs/jimmy.key`.
 
 ```console
 # Start a job; everything after -- belongs to the job
@@ -441,17 +443,20 @@ $ worker start -- ping -c 3 localhost
 
 # Status: args are joined onto the Command line
 $ worker status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-ID:       7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-Owner:    jimmy
-Command:  ping -c 3 localhost
-State:    RUNNING
+ID:        7GQ2KH5ZC3MJXN4R6T8VWYBDEF
+Owner:     jimbob
+Command:   ping -c 3 localhost
+State:     RUNNING
 
 # Args containing spaces are quoted, so the line shows exactly what ran
 $ worker status M3XR8TQ2ZK7HJWNC4PAB5DVEFY
-Command:  bash -c "sleep 300; echo done"
-State:    RUNNING
+Command:   bash -c "sleep 300; echo done"
+State:     RUNNING
 
-# Stream output from the beginning until the job ends (Ctrl-C stops watching, not the job)
+# Stream output from the beginning until the job ends (Ctrl-C stops watching, not the job).
+# Exits non-zero if the job didn't exit 0, so `worker output $id && next` stops on failure.
+# On a terminal, control characters other than newline and tab are shown escaped
+# (e.g. \x1b), so a job can't drive the viewer's terminal; redirected, bytes are exact.
 $ worker output 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
 PING localhost (127.0.0.1) 56(84) bytes of data.
 64 bytes from localhost (127.0.0.1): icmp_seq=1 ttl=64 time=0.03 ms
@@ -461,7 +466,7 @@ PING localhost (127.0.0.1) 56(84) bytes of data.
 # so the line is left out rather than printed as 0
 $ worker status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
 ID:        7GQ2KH5ZC3MJXN4R6T8VWYBDEF
-Owner:     jimmy
+Owner:     jimbob
 Command:   ping -c 3 localhost
 State:     EXITED
 Exit code: 0
@@ -476,8 +481,8 @@ $ worker status Q8WN3KZT5RJC7HMX2PVB4DYEFA
 State:     EXITED
 Exit code: -1 (signal 11: segmentation fault)
 
-# Errors go to stderr with a non-zero exit code
-$ worker --cert certs/jimbob.crt --key certs/jimbob.key status 7GQ2KH5ZC3MJXN4R6T8VWYBDEF
+# Errors go to stderr with a non-zero exit code, e.g. jimbob asking about a job jimmy started
+$ worker status H4TZ9KQ2MWX7RJC3NPAB5DVEFY
 error: job not found
 ```
 
