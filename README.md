@@ -52,12 +52,14 @@ worker [flags] output <job-id>                stream a job's output until it end
 worker [flags] stop <job-id>                  stop a job and show its final status
 
 --server  server address (default 127.0.0.1:50051)
---cert    client certificate; its common name is the user (default certs/jimmy.crt)
---key     client certificate's private key (default certs/jimmy.key)
+--cert    client certificate; its common name is the user (default certs/jimbob.crt)
+--key     client certificate's private key (default certs/jimbob.key)
 --ca      CA that must have signed the server certificate (default certs/ca.crt)
 ```
 
 Errors go to stderr as `error: <message>`, with exit code 1 (2 for bad usage).
+`output` also exits 1 if the job didn't exit 0, so `worker output $id && next`
+stops when the job failed.
 
 ### Users
 
@@ -66,13 +68,16 @@ the server:
 
 | User | Certificate | Role |
 | --- | --- | --- |
-| `jimmy` | `certs/jimmy.crt`, `certs/jimmy.key` (the CLI's default) | admin: all jobs |
-| `jimbob` | `certs/jimbob.crt`, `certs/jimbob.key` | user: only jobs they started |
+| `jimbob` | `certs/jimbob.crt`, `certs/jimbob.key` (the CLI's default) | user: only jobs they started |
+| `jimmy` | `certs/jimmy.crt`, `certs/jimmy.key` | admin: all jobs |
+
+The CLI defaults to the least privileged user; acting as the admin means asking
+for it with `--cert certs/jimmy.crt --key certs/jimmy.key`.
 
 ## Demo
 
-Start a job as jimmy. Everything after `--` belongs to the job, and `start`
-prints only the job ID:
+Start a job. With no flags you're jimbob. Everything after `--` belongs to the
+job, and `start` prints only the job ID:
 
 ```console
 $ ./bin/worker start -- ping -c 3 localhost
@@ -80,17 +85,9 @@ JAPLPGN2E2QMTEYX7RB47CUGIV
 
 $ ./bin/worker status JAPLPGN2E2QMTEYX7RB47CUGIV
 ID:        JAPLPGN2E2QMTEYX7RB47CUGIV
-Owner:     jimmy
+Owner:     jimbob
 Command:   ping -c 3 localhost
 State:     RUNNING
-```
-
-jimbob can't see jimmy's job. It looks exactly like a job that doesn't exist,
-so job IDs can't be probed:
-
-```console
-$ ./bin/worker --cert certs/jimbob.crt --key certs/jimbob.key status JAPLPGN2E2QMTEYX7RB47CUGIV
-error: job not found
 ```
 
 Stream the output. It starts from the first byte, even after the job has
@@ -105,30 +102,47 @@ PING localhost (127.0.0.1) 56(84) bytes of data.
 
 $ ./bin/worker status JAPLPGN2E2QMTEYX7RB47CUGIV
 ID:        JAPLPGN2E2QMTEYX7RB47CUGIV
-Owner:     jimmy
+Owner:     jimbob
 Command:   ping -c 3 localhost
 State:     EXITED
 Exit code: 0
 ```
 
-jimbob starts a job of their own. There is no shell, so pipes and `;` need
-one as the job itself. jimmy is an admin and can see it:
+On a terminal, `output` shows control characters escaped (e.g. `\x1b[2J`
+instead of clearing the screen), so a job can't take over whoever is watching
+it. Redirected to a file or pipe, the bytes are exact.
+
+jimmy, the admin, starts a job. There is no shell, so pipes and `;` need one as
+the job itself:
 
 ```console
-$ ./bin/worker --cert certs/jimbob.crt --key certs/jimbob.key start -- bash -c "sleep 300; echo done"
+$ ./bin/worker --cert certs/jimmy.crt --key certs/jimmy.key start -- bash -c "sleep 300; echo done"
 YG553VOG5UYGVLU4NABF4TCQXT
-
-$ ./bin/worker status YG553VOG5UYGVLU4NABF4TCQXT
-ID:        YG553VOG5UYGVLU4NABF4TCQXT
-Owner:     jimbob
-Command:   bash -c "sleep 300; echo done"
-State:     RUNNING
 ```
 
-Stop it. The job is killed with SIGKILL:
+jimbob can't see it. It looks exactly like a job that doesn't exist, so job IDs
+can't be probed:
 
 ```console
-$ ./bin/worker stop YG553VOG5UYGVLU4NABF4TCQXT
+$ ./bin/worker status YG553VOG5UYGVLU4NABF4TCQXT
+error: job not found
+```
+
+jimmy can see every job, including jimbob's:
+
+```console
+$ ./bin/worker --cert certs/jimmy.crt --key certs/jimmy.key status JAPLPGN2E2QMTEYX7RB47CUGIV
+ID:        JAPLPGN2E2QMTEYX7RB47CUGIV
+Owner:     jimbob
+Command:   ping -c 3 localhost
+State:     EXITED
+Exit code: 0
+```
+
+Stop jimmy's job. It is killed with SIGKILL:
+
+```console
+$ ./bin/worker --cert certs/jimmy.crt --key certs/jimmy.key stop YG553VOG5UYGVLU4NABF4TCQXT
 State:     STOPPED
 Exit code: -1 (signal 9: killed)
 ```

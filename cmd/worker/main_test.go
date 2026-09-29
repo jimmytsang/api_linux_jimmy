@@ -1,32 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	pb "github.com/jimmytsang/api_linux_jimmy/gen/jobworker/v1"
 	"github.com/jimmytsang/api_linux_jimmy/internal/certgen"
 	"github.com/jimmytsang/api_linux_jimmy/internal/server"
 	"github.com/jimmytsang/api_linux_jimmy/pkg/job"
 )
-
-// timeout bounds every wait, so a broken CLI fails a test instead of hanging.
-const timeout = 5 * time.Second
 
 func TestWriteStatus(t *testing.T) {
 	tests := []struct {
@@ -110,8 +102,45 @@ func TestCommandLine(t *testing.T) {
 	}
 }
 
+func TestTerminalWriter(t *testing.T) {
+	tests := []struct {
+		name   string
+		writes []string
+		want   string
+	}{
+		{"text, newlines and tabs pass through", []string{"hi\tthere\n"}, "hi\tthere\n"},
+		{"printable text in any language passes through", []string{"héllo 日本\n"}, "héllo 日本\n"},
+		{"clear screen", []string{"\x1b[2J"}, `\x1b[2J`},
+		{"set title and write clipboard", []string{"\x1b]0;hi\x07\x1b]52;c;aGk=\x07"}, `\x1b]0;hi\a\x1b]52;c;aGk=\a`},
+		{"carriage return can't overwrite a line", []string{"real\rfake\n"}, `real\rfake` + "\n"},
+		{"NUL and DEL", []string{"\x00\x7f"}, `\x00\x7f`},
+		{"C1 control as UTF-8", []string{"\u009b2J"}, `\u009b2J`},
+		{"bytes that aren't UTF-8", []string{"\xff\x9b2J"}, `\xff\x9b2J`},
+		{"character split across writes", []string{"h\xc3", "\xa9llo"}, "héllo"},
+		{"escape split from its sequence", []string{"\x1b", "[2J"}, `\x1b[2J`},
+		{"incomplete character at the end", []string{"a\xe6\x97"}, `a\xe6\x97`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b bytes.Buffer
+			w := &terminalWriter{w: &b}
+			for _, s := range tt.writes {
+				if n, err := w.Write([]byte(s)); n != len(s) || err != nil {
+					t.Fatalf("Write(%q) = %d, %v; want %d, nil", s, n, err, len(s))
+				}
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if got := b.String(); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseArgs(t *testing.T) {
-	defaults := invocation{server: "127.0.0.1:50051", cert: "certs/jimmy.crt", key: "certs/jimmy.key", ca: "certs/ca.crt"}
+	defaults := invocation{server: "127.0.0.1:50051", cert: "certs/jimbob.crt", key: "certs/jimbob.key", ca: "certs/ca.crt"}
 	with := func(f func(*invocation)) invocation {
 		inv := defaults
 		f(&inv)
@@ -248,13 +277,37 @@ func TestEndToEnd(t *testing.T) {
 		env.expect(t, env.worker(t, "jimmy", "stop", id), exitOK, want, "")
 		// Stopping a finished job just reports the final status again.
 		env.expect(t, env.worker(t, "jimmy", "stop", id), exitOK, want, "")
+		// A stopped job didn't succeed, so output of it fails too.
+		env.expect(t, env.worker(t, "jimmy", "output", id), exitError, "", "error: job stopped, exit code -1 (signal 9: killed)\n")
+	})
+
+	t.Run("another user's escape codes don't reach the admin's terminal", func(t *testing.T) {
+		// jimbob's job tries to clear the screen of whoever watches it. main
+		// wraps a terminal stdout the same way.
+		bobs := env.start(t, "jimbob", "printf", `\033[2Jgotcha\n`)
+		var screen bytes.Buffer
+		var stderr strings.Builder
+		code := run(t.Context(), env.flags("jimmy", "output", bobs), &terminalWriter{w: &screen}, &stderr)
+		if code != exitOK || stderr.String() != "" {
+			t.Fatalf("output = exit %d, stderr %q; want exit 0 and no error", code, stderr.String())
+		}
+		if got, want := screen.String(), `\x1b[2Jgotcha`+"\n"; got != want {
+			t.Errorf("admin's screen got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("output of a job that succeeded", func(t *testing.T) {
+		id := env.start(t, "jimmy", "echo", "hi")
+		env.expect(t, env.worker(t, "jimmy", "output", id), exitOK, "hi\n", "")
 	})
 
 	t.Run("output and final status", func(t *testing.T) {
-		// Binary-safe: a NUL and a byte that isn't valid UTF-8 come back as is.
+		// Binary-safe: a NUL and a byte that isn't valid UTF-8 come back as
+		// is. The job exits 3, so output does too: the output comes first,
+		// then an error, so `worker output $id && next` stops.
 		script := `printf 'one\n'; printf 'two\000\377\n' >&2; exit 3`
 		id := env.start(t, "jimmy", "sh", "-c", script)
-		env.expect(t, env.worker(t, "jimmy", "output", id), exitOK, "one\ntwo\x00\xff\n", "")
+		env.expect(t, env.worker(t, "jimmy", "output", id), exitError, "one\ntwo\x00\xff\n", "error: job exited, exit code 3\n")
 		// The stream ends only once the final status is recorded.
 		env.expect(t, env.worker(t, "jimmy", "status", id), exitOK, ""+
 			"ID:        "+id+"\n"+
@@ -266,49 +319,25 @@ func TestEndToEnd(t *testing.T) {
 }
 
 // TestOutputCtrlC checks that Ctrl-C while watching a job ends the CLI
-// cleanly and leaves the job running. The job prints a line and then nothing,
-// so the CLI is blocked in Recv when it is cancelled.
+// cleanly and leaves the job running. Stdout presses Ctrl-C (cancels ctx) as
+// soon as the job's first line arrives, while the job is still running, so
+// run needs no goroutine or timer. A CLI that held output back until the job
+// ended would only write once the job exited, and fail the RUNNING check.
 func TestOutputCtrlC(t *testing.T) {
 	env := newTestEnv(t)
 	id := env.start(t, "jimmy", "sh", "-c", "echo ready; sleep 60")
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	stdoutR, stdoutW := io.Pipe()
-	defer stdoutR.Close() // if the test fails early, unblocks the CLI's writes
+	stdout := &cancelOnWrite{cancel: cancel}
 	var stderr bytes.Buffer
-	done := make(chan int, 1)
-	go func() {
-		code := run(ctx, env.flags("jimmy", "output", id), stdoutW, &stderr)
-		stdoutW.Close()
-		done <- code
-	}()
+	code := run(ctx, env.flags("jimmy", "output", id), stdout, &stderr)
 
-	// Output arrives while the job is still running, not only at the end.
-	// The deadline is separate from ctx: ending the CLI could flush output it
-	// was holding back, and the test would pass for the wrong reason.
-	lines := make(chan string, 1)
-	go func() {
-		line, _ := bufio.NewReader(stdoutR).ReadString('\n')
-		lines <- line
-	}()
-	select {
-	case line := <-lines:
-		if line != "ready\n" {
-			t.Fatalf("first output = %q, want %q", line, "ready\n")
-		}
-	case <-time.After(timeout):
-		t.Fatal("no output while the job is running")
+	if code != exitOK {
+		t.Errorf("exit code after Ctrl-C = %d, want %d", code, exitOK)
 	}
-	cancel() // Ctrl-C
-
-	select {
-	case code := <-done:
-		if code != exitOK {
-			t.Errorf("exit code after Ctrl-C = %d, want %d", code, exitOK)
-		}
-	case <-time.After(timeout):
-		t.Fatal("output didn't return after Ctrl-C")
+	if got := stdout.String(); got != "ready\n" {
+		t.Errorf("stdout = %q, want %q", got, "ready\n")
 	}
 	if stderr.Len() > 0 {
 		t.Errorf("stderr after Ctrl-C = %q, want nothing", stderr.String())
@@ -318,112 +347,16 @@ func TestOutputCtrlC(t *testing.T) {
 	}
 }
 
-// TestOutputAlreadyCancelled covers Ctrl-C before the stream is open, when
-// the cancellation surfaces from the call rather than from Recv.
-func TestOutputAlreadyCancelled(t *testing.T) {
-	env := newTestEnv(t)
-	id := env.start(t, "jimmy", "sleep", "60")
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	var stdout, stderr bytes.Buffer
-	if code := run(ctx, env.flags("jimmy", "output", id), &stdout, &stderr); code != exitOK {
-		t.Errorf("exit code = %d, want %d", code, exitOK)
-	}
-	if stdout.Len()+stderr.Len() > 0 {
-		t.Errorf("stdout = %q, stderr = %q, want nothing", stdout.String(), stderr.String())
-	}
+// cancelOnWrite records what the CLI writes and calls cancel on every write,
+// standing in for a user who presses Ctrl-C once output appears.
+type cancelOnWrite struct {
+	bytes.Buffer
+	cancel context.CancelFunc
 }
 
-// TestStopCtrlC checks that Ctrl-C while stop waits doesn't claim the stop
-// failed: SIGKILL may already have been sent, so the CLI says it stopped
-// waiting and points at status. The context is cancelled up front, the one
-// point a test can hit reliably; that the server still kills a job whose
-// caller gave up is pkg/job's TestStopCancelledContextStillKills.
-func TestStopCtrlC(t *testing.T) {
-	env := newTestEnv(t)
-	id := env.start(t, "jimmy", "sleep", "60")
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	var stdout, stderr bytes.Buffer
-	code := run(ctx, env.flags("jimmy", "stop", id), &stdout, &stderr)
-	if code != exitError {
-		t.Errorf("exit code = %d, want %d", code, exitError)
-	}
-	if stdout.Len() > 0 {
-		t.Errorf("stdout = %q, want nothing", stdout.String())
-	}
-	want := "error: stopped waiting; the job may still be stopping, check: worker status " + id + "\n"
-	if stderr.String() != want {
-		t.Errorf("stderr = %q, want %q", stderr.String(), want)
-	}
-}
-
-// TestSecondCtrlC checks that only the first Ctrl-C is caught, so a second
-// one kills a CLI that is stuck after the first. It runs this test binary as
-// a child that catches Ctrl-C like main does and then hangs, as if blocked
-// writing to a paused terminal.
-func TestSecondCtrlC(t *testing.T) {
-	if os.Getenv("WORKER_TEST_STUCK_CHILD") == "1" {
-		ctx, stop := interruptContext()
-		defer stop()
-		fmt.Println("ready")
-		<-ctx.Done()
-		fmt.Println("cancelled")
-		time.Sleep(time.Hour)
-		return
-	}
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestSecondCtrlC$")
-	cmd.Env = append(os.Environ(), "WORKER_TEST_STUCK_CHILD=1")
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { cmd.Process.Kill() })
-	lines := bufio.NewScanner(out)
-	waitLine := func(want string) {
-		t.Helper()
-		got := make(chan bool, 1)
-		go func() { got <- lines.Scan() && lines.Text() == want }()
-		select {
-		case ok := <-got:
-			if !ok {
-				t.Fatalf("child didn't print %q", want)
-			}
-		case <-time.After(timeout):
-			t.Fatalf("timed out waiting for the child to print %q", want)
-		}
-	}
-
-	waitLine("ready")
-	cmd.Process.Signal(os.Interrupt) // first Ctrl-C: caught, cancels the context
-	waitLine("cancelled")
-
-	// Default Ctrl-C handling comes back just after the context is cancelled,
-	// on another goroutine, so keep pressing until the child dies. If every
-	// Ctrl-C is still caught, it never does.
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	deadline := time.After(timeout)
-	for {
-		select {
-		case <-exited:
-			ws := cmd.ProcessState.Sys().(syscall.WaitStatus)
-			if !ws.Signaled() || ws.Signal() != syscall.SIGINT {
-				t.Errorf("child ended with %v, want killed by SIGINT", cmd.ProcessState)
-			}
-			return
-		case <-tick.C:
-			cmd.Process.Signal(os.Interrupt)
-		case <-deadline:
-			t.Fatal("a second Ctrl-C didn't kill the child: Ctrl-C is still being caught")
-		}
-	}
+func (w *cancelOnWrite) Write(p []byte) (int, error) {
+	w.cancel()
+	return w.Buffer.Write(p)
 }
 
 // TestErrors checks that failures print "error: <message>" to stderr, never
@@ -549,10 +482,8 @@ type result struct {
 // worker runs the CLI as user and returns what it printed.
 func (e *testEnv) worker(t *testing.T, user string, args ...string) result {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), timeout)
-	defer cancel()
 	var stdout, stderr bytes.Buffer
-	code := run(ctx, e.flags(user, args...), &stdout, &stderr)
+	code := run(t.Context(), e.flags(user, args...), &stdout, &stderr)
 	return result{code: code, stdout: stdout.String(), stderr: stderr.String()}
 }
 

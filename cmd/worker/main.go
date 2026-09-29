@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 	"unicode"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -41,20 +43,27 @@ const (
 func main() {
 	// Ctrl-C cancels ctx. For output that means stop watching: the job keeps
 	// running on the server.
-	ctx, stop := interruptContext()
-	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	var stdout io.Writer = os.Stdout
+	var tw *terminalWriter
+	if isTerminal(os.Stdout) {
+		// A job's output is the job owner's bytes shown on someone else's
+		// screen, possibly an admin's. Redirected to a file or pipe, it stays
+		// byte for byte.
+		tw = &terminalWriter{w: os.Stdout}
+		stdout = tw
+	}
+	code := run(ctx, os.Args[1:], stdout, os.Stderr)
+	if tw != nil {
+		tw.Flush()
+	}
 	stop()
 	os.Exit(code)
 }
 
-// interruptContext returns a context that the first Ctrl-C cancels. Only the
-// first is caught: after it, Ctrl-C gets its default behaviour back, so a
-// second one kills the CLI even if it is stuck, e.g. writing to a paused
-// terminal.
-func interruptContext() (context.Context, context.CancelFunc) {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	context.AfterFunc(ctx, stop)
-	return ctx, stop
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // run is the whole CLI minus the process: it parses args, makes the call and
@@ -95,8 +104,10 @@ func newFlagSet(inv *invocation) *flag.FlagSet {
 	// that can resolve to ::1 first, and when the server then rejects our
 	// certificate, gRPC reports the ::1 "connection refused" instead.
 	fs.StringVar(&inv.server, "server", "127.0.0.1:50051", "server address")
-	fs.StringVar(&inv.cert, "cert", "certs/jimmy.crt", "client certificate; its common name is the user")
-	fs.StringVar(&inv.key, "key", "certs/jimmy.key", "client certificate's private key")
+	// The default user is the least privileged one. Acting as the admin takes
+	// asking for it: --cert certs/jimmy.crt --key certs/jimmy.key.
+	fs.StringVar(&inv.cert, "cert", "certs/jimbob.crt", "client certificate; its common name is the user")
+	fs.StringVar(&inv.key, "key", "certs/jimbob.key", "client certificate's private key")
 	fs.StringVar(&inv.ca, "ca", "certs/ca.crt", "CA that must have signed the server certificate")
 	return fs
 }
@@ -181,12 +192,6 @@ func execute(ctx context.Context, inv invocation, stdout io.Writer) error {
 		writeStatus(stdout, resp.GetStatus())
 	case "stop":
 		resp, err := c.StopJob(ctx, &pb.StopJobRequest{JobId: inv.jobID})
-		if err != nil && ctx.Err() != nil {
-			// Ctrl-C while waiting for the job to exit. If the request
-			// reached the server, SIGKILL has already been sent, so don't
-			// claim the stop failed.
-			return fmt.Errorf("stopped waiting; the job may still be stopping, check: worker status %s", inv.jobID)
-		}
 		if err != nil {
 			return err
 		}
@@ -198,7 +203,8 @@ func execute(ctx context.Context, inv invocation, stdout io.Writer) error {
 }
 
 // streamOutput copies a job's output to stdout, byte for byte, from the first
-// byte until the job ends.
+// byte until the job ends. It then fails unless the job exited 0, so scripts
+// like `worker output $id && deploy` stop when the job failed.
 func streamOutput(ctx context.Context, c pb.JobWorkerClient, id string, stdout io.Writer) error {
 	stream, err := c.StreamJobOutput(ctx, &pb.StreamJobOutputRequest{JobId: id})
 	if err != nil {
@@ -206,6 +212,9 @@ func streamOutput(ctx context.Context, c pb.JobWorkerClient, id string, stdout i
 	}
 	for {
 		msg, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return streamEnd(ctx, err)
 		}
@@ -213,20 +222,27 @@ func streamOutput(ctx context.Context, c pb.JobWorkerClient, id string, stdout i
 			return err
 		}
 	}
+	// The stream only ends once the final status is recorded, so this is it.
+	resp, err := c.GetJobStatus(ctx, &pb.GetJobStatusRequest{JobId: id})
+	if err != nil {
+		return streamEnd(ctx, err)
+	}
+	st := resp.GetStatus()
+	if st.GetState() == pb.JobState_JOB_STATE_EXITED && st.GetExitCode() == 0 {
+		return nil
+	}
+	return fmt.Errorf("job %s, exit code %s", strings.ToLower(stateName(st)), exitCode(st))
 }
 
-// streamEnd turns the error that ended a stream into the command's result.
+// streamEnd turns the error that ended a stream early into the command's
+// result.
 func streamEnd(ctx context.Context, err error) error {
-	switch {
-	case err == io.EOF: // the job ended
-		return nil
-	case ctx.Err() != nil:
+	if ctx.Err() != nil {
 		// Ctrl-C: the user stopped watching, which isn't an error. The server
 		// sees the stream cancelled and leaves the job running.
 		return nil
-	default:
-		return err
 	}
+	return err
 }
 
 // field writes one "Label:  value" line. Values start in the same column on
@@ -246,17 +262,27 @@ func writeStatus(w io.Writer, st *pb.JobStatus) {
 // writeResult writes the State line and, once the job has finished, the Exit
 // code line.
 func writeResult(w io.Writer, st *pb.JobStatus) {
-	field(w, "State", strings.TrimPrefix(st.GetState().String(), "JOB_STATE_"))
+	field(w, "State", stateName(st))
 	if st.ExitCode == nil {
 		return // still running: there is no exit code yet, and 0 would be wrong
 	}
+	field(w, "Exit code", exitCode(st))
+}
+
+func stateName(st *pb.JobStatus) string {
+	return strings.TrimPrefix(st.GetState().String(), "JOB_STATE_")
+}
+
+// exitCode formats a finished job's exit code, e.g. "0" or
+// "-1 (signal 9: killed)".
+func exitCode(st *pb.JobStatus) string {
 	code := strconv.Itoa(int(st.GetExitCode()))
 	if st.Signal != nil {
 		// The API sends the signal's number, and the standard library has no
 		// table of names like SIGKILL, so show the number with its description.
 		code += fmt.Sprintf(" (signal %d: %s)", st.GetSignal(), syscall.Signal(st.GetSignal()))
 	}
-	field(w, "Exit code", code)
+	return code
 }
 
 // commandLine joins a command and its args with spaces, so the line shows
@@ -283,4 +309,51 @@ func quoteIfNeeded(s string) string {
 
 func needsQuote(r rune) bool {
 	return unicode.IsSpace(r) || r == '"' || r == '\'' || r == '\\' || !unicode.IsPrint(r)
+}
+
+// terminalWriter shows control characters as text, e.g. \x1b or \r, instead
+// of letting a terminal act on them, so the bytes written can't clear the
+// screen, move the cursor, set the title or write the clipboard. Newlines and
+// tabs pass through, and so does printable text in any language. Bytes that
+// aren't valid UTF-8 are shown as \xNN, since some terminals read a lone byte
+// such as 0x9b as a control.
+type terminalWriter struct {
+	w io.Writer
+	// rest is the start of a UTF-8 character split across writes: output
+	// arrives in chunks that can cut one in half.
+	rest []byte
+}
+
+func (t *terminalWriter) Write(p []byte) (int, error) {
+	buf := append(t.rest, p...)
+	var out []byte
+	for len(buf) > 0 && utf8.FullRune(buf) {
+		r, size := utf8.DecodeRune(buf)
+		switch {
+		case r == utf8.RuneError && size == 1: // not valid UTF-8
+			out = fmt.Appendf(out, `\x%02x`, buf[0])
+		case r == '\n' || r == '\t' || !unicode.IsControl(r):
+			out = append(out, buf[:size]...)
+		default: // C0 controls such as ESC, DEL, and C1 controls
+			q := strconv.QuoteRune(r)
+			out = append(out, q[1:len(q)-1]...) // drop the quotes: \x1b, \u009b
+		}
+		buf = buf[size:]
+	}
+	t.rest = bytes.Clone(buf)
+	if _, err := t.w.Write(out); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Flush writes a character left incomplete when the output ended, escaped.
+func (t *terminalWriter) Flush() error {
+	var out []byte
+	for _, b := range t.rest {
+		out = fmt.Appendf(out, `\x%02x`, b)
+	}
+	t.rest = nil
+	_, err := t.w.Write(out)
+	return err
 }
