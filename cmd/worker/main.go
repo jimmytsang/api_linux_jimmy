@@ -41,10 +41,20 @@ const (
 func main() {
 	// Ctrl-C cancels ctx. For output that means stop watching: the job keeps
 	// running on the server.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := interruptContext()
 	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
+}
+
+// interruptContext returns a context that the first Ctrl-C cancels. Only the
+// first is caught: after it, Ctrl-C gets its default behaviour back, so a
+// second one kills the CLI even if it is stuck, e.g. writing to a paused
+// terminal.
+func interruptContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	context.AfterFunc(ctx, stop)
+	return ctx, stop
 }
 
 // run is the whole CLI minus the process: it parses args, makes the call and
@@ -112,7 +122,9 @@ func parseArgs(args []string) (invocation, error) {
 		}
 		inv.job = rest[1:]
 	case "status", "output", "stop":
-		if len(rest) != 1 {
+		// Job IDs never start with "-", so one that does is a flag placed
+		// after the command, e.g. `worker status -h`, not an ID to send.
+		if len(rest) != 1 || strings.HasPrefix(rest[0], "-") {
 			return inv, fmt.Errorf("usage: worker [flags] %s <job-id>", inv.command)
 		}
 		inv.jobID = rest[0]
@@ -169,6 +181,12 @@ func execute(ctx context.Context, inv invocation, stdout io.Writer) error {
 		writeStatus(stdout, resp.GetStatus())
 	case "stop":
 		resp, err := c.StopJob(ctx, &pb.StopJobRequest{JobId: inv.jobID})
+		if err != nil && ctx.Err() != nil {
+			// Ctrl-C while waiting for the job to exit. If the request
+			// reached the server, SIGKILL has already been sent, so don't
+			// claim the stop failed.
+			return fmt.Errorf("stopped waiting; the job may still be stopping, check: worker status %s", inv.jobID)
+		}
 		if err != nil {
 			return err
 		}

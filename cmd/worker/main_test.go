@@ -10,10 +10,12 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -149,6 +151,10 @@ func TestParseArgs(t *testing.T) {
 		{name: "status without ID", args: []string{"status"}, wantErr: "usage: worker [flags] status <job-id>"},
 		{name: "stop with two IDs", args: []string{"stop", "ID1", "ID2"}, wantErr: "usage: worker [flags] stop <job-id>"},
 		{name: "flag after status", args: []string{"status", "--cert", "c.crt", "ID1"}, wantErr: "usage: worker [flags] status <job-id>"},
+		// A lone flag after the command would otherwise be sent as the job ID.
+		{name: "help after status", args: []string{"status", "-h"}, wantErr: "usage: worker [flags] status <job-id>"},
+		{name: "help after stop", args: []string{"stop", "--help"}, wantErr: "usage: worker [flags] stop <job-id>"},
+		{name: "help after output", args: []string{"output", "-h"}, wantErr: "usage: worker [flags] output <job-id>"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -328,21 +334,108 @@ func TestOutputAlreadyCancelled(t *testing.T) {
 	}
 }
 
+// TestStopCtrlC checks that Ctrl-C while stop waits doesn't claim the stop
+// failed: SIGKILL may already have been sent, so the CLI says it stopped
+// waiting and points at status. The context is cancelled up front, the one
+// point a test can hit reliably; that the server still kills a job whose
+// caller gave up is pkg/job's TestStopCancelledContextStillKills.
+func TestStopCtrlC(t *testing.T) {
+	env := newTestEnv(t)
+	id := env.start(t, "jimmy", "sleep", "60")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, env.flags("jimmy", "stop", id), &stdout, &stderr)
+	if code != exitError {
+		t.Errorf("exit code = %d, want %d", code, exitError)
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("stdout = %q, want nothing", stdout.String())
+	}
+	want := "error: stopped waiting; the job may still be stopping, check: worker status " + id + "\n"
+	if stderr.String() != want {
+		t.Errorf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
+// TestSecondCtrlC checks that only the first Ctrl-C is caught, so a second
+// one kills a CLI that is stuck after the first. It runs this test binary as
+// a child that catches Ctrl-C like main does and then hangs, as if blocked
+// writing to a paused terminal.
+func TestSecondCtrlC(t *testing.T) {
+	if os.Getenv("WORKER_TEST_STUCK_CHILD") == "1" {
+		ctx, stop := interruptContext()
+		defer stop()
+		fmt.Println("ready")
+		<-ctx.Done()
+		fmt.Println("cancelled")
+		time.Sleep(time.Hour)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSecondCtrlC$")
+	cmd.Env = append(os.Environ(), "WORKER_TEST_STUCK_CHILD=1")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill() })
+	lines := bufio.NewScanner(out)
+	waitLine := func(want string) {
+		t.Helper()
+		got := make(chan bool, 1)
+		go func() { got <- lines.Scan() && lines.Text() == want }()
+		select {
+		case ok := <-got:
+			if !ok {
+				t.Fatalf("child didn't print %q", want)
+			}
+		case <-time.After(timeout):
+			t.Fatalf("timed out waiting for the child to print %q", want)
+		}
+	}
+
+	waitLine("ready")
+	cmd.Process.Signal(os.Interrupt) // first Ctrl-C: caught, cancels the context
+	waitLine("cancelled")
+
+	// Default Ctrl-C handling comes back just after the context is cancelled,
+	// on another goroutine, so keep pressing until the child dies. If every
+	// Ctrl-C is still caught, it never does.
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case <-exited:
+			ws := cmd.ProcessState.Sys().(syscall.WaitStatus)
+			if !ws.Signaled() || ws.Signal() != syscall.SIGINT {
+				t.Errorf("child ended with %v, want killed by SIGINT", cmd.ProcessState)
+			}
+			return
+		case <-tick.C:
+			cmd.Process.Signal(os.Interrupt)
+		case <-deadline:
+			t.Fatal("a second Ctrl-C didn't kill the child: Ctrl-C is still being caught")
+		}
+	}
+}
+
 // TestErrors checks that failures print "error: <message>" to stderr, never
 // the raw "rpc error: code = ..." text, and exit non-zero.
 func TestErrors(t *testing.T) {
 	env := newTestEnv(t)
 
-	// A port nothing listens on: listen, then close.
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadAddr := lis.Addr().String()
-	lis.Close()
-
+	// A socket path in a fresh temp directory, so nothing can be listening.
+	// A just-closed TCP port could be taken by another test's listener
+	// before the CLI dials it.
 	notRunning := env.flags("jimmy", "status", "ID1")
-	notRunning[1] = deadAddr // the value of --server
+	notRunning[1] = "unix://" + filepath.Join(t.TempDir(), "no-server.sock") // the value of --server
 	missingCert := env.flags("jimmy", "status", "ID1")
 	missingCert[3] = "/no/such.crt" // the value of --cert
 
